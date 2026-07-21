@@ -1,0 +1,40 @@
+# Python 缓存与本地虚拟环境
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+
+# 板端离线依赖及第三方运行库
+vendor/
+*.whl
+
+# C/C++、CMake 和 FPGA 构建产物
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+*.bit
+*.sbit
+*.bin
+
+# 模型与运行时数据由部署流程单独管理
+*.rknn
+*.onnx
+*.mnn
+
+# 编辑器、系统及运行日志
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.swp
+

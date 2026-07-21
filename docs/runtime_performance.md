@@ -1,0 +1,42 @@
+# 实时帧率与延迟优化
+
+当前实时链路采用三条相互解耦的执行路径：
+
+1. 摄像头线程持续读取 V4L2，只保留最新帧，避免处理速度低于摄像头时积压旧画面。
+2. FPGA 线程只处理最新的 `112x64` 灰度帧，PCIe 写入、启动、等待和掩码读回不再阻塞 HDMI。
+3. RKNN 检测线程继续采用最新任务覆盖策略；连续命中同一车牌时复用最近一次成功 OCR，减少 HyperLPR 重复推理。
+
+RKNN 路线直接从摄像头原图一次 letterbox 到模型的 `640x640`，不再经过 `1280 -> 960 -> 640` 两次缩放。两个 NPU 结果之间使用低分辨率稀疏光流更新车牌框位置，降低移动时的拖尾。
+
+## 日志指标
+
+- `real_fps`：程序实际 HDMI 主循环帧率；屏幕上的 `FPS` 仍按比赛展示要求显示为两倍。
+- `fpga_ms`：一次 FPGA 往返处理耗时。FPGA 已异步，因此该值不会直接阻塞 HDMI。
+- `det_ms`：一次 RKNN 检测及必要 OCR 的总耗时，是判断模型瓶颈的主要指标。
+- `det=1`：检测线程正在工作，不代表 HDMI 主循环被阻塞。
+- `fpga_async=1`：FPGA 后台线程正在处理最新任务。
+
+## 新增参数
+
+- `--camera-buffered`：关闭最新帧采集，恢复传统同步 `cap.read()`，仅用于兼容性排查。
+- `--disable-box-tracking`：关闭光流跟随，直接显示 NPU 原始框，用于 A/B 对比。
+- `--rknn-ocr-cache-seconds 2.0`：成功 OCR 的默认复用时间。
+- `--rknn-ocr-cache-iou 0.50`：复用 OCR 结果所需的最低框重叠度。
+
+当前常用启动命令无需增加参数即可启用最新帧、异步 FPGA、OCR 缓存和框跟随。不要添加 `--camera-buffered` 或 `--disable-box-tracking`。
+
+## 模型侧上限
+
+当前 `yolov8s.rknn` 由非量化 ONNX 默认转换得到，文件约 7.45 MB。若日志中的 `det_ms` 仍长期很高，下一步应使用板端真实车牌画面制作校准集并生成 INT8 RKNN：
+
+```powershell
+python .\convert_plate_to_rknn.py `
+  --onnx .\weights\yolov8s.onnx `
+  --output .\weights\yolov8s_int8.rknn `
+  --target rk3568 `
+  --do-quantization `
+  --dataset .\calibration.txt
+```
+
+`calibration.txt` 每行写一张校准图片路径，建议使用 100 至 300 张来自实际摄像头、覆盖远近距离和各种车牌类型的图片。INT8 可以明显降低 NPU 推理时间，但必须用真实场景校准并对识别率做 A/B 测试，不能直接覆盖当前模型。
+

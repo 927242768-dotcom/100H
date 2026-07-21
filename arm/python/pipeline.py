@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import os
 import threading
@@ -598,6 +600,157 @@ def stabilize_detections_with_history(
     return stabilized
 
 
+class BoxMotionTracker:
+    """在两次检测结果之间用稀疏光流更新框位置。"""
+
+    def __init__(self, tracking_width: int = 640) -> None:
+        self._tracking_width = max(160, int(tracking_width))
+        self._previous_gray: np.ndarray | None = None
+        self._detections: List[Detection] = []
+        self._generation = -1
+
+    @staticmethod
+    def _copy_with_box(det: Detection, box: Tuple[int, int, int, int]) -> Detection:
+        return Detection(
+            label=det.label,
+            raw_label=det.raw_label,
+            type_name=det.type_name,
+            full_text=det.full_text,
+            score=det.score,
+            box=box,
+        )
+
+    @staticmethod
+    def _targets_match(det_a: Detection, det_b: Detection) -> bool:
+        if box_iou(det_a.box, det_b.box) >= 0.10:
+            return True
+        ax, ay, aw, ah = det_a.box
+        bx, by, bw, bh = det_b.box
+        center_distance = (
+            (ax + aw * 0.5 - bx - bw * 0.5) ** 2
+            + (ay + ah * 0.5 - by - bh * 0.5) ** 2
+        ) ** 0.5
+        return center_distance <= max(24.0, max(aw, ah, bw, bh) * 1.25)
+
+    def _resize_gray(self, gray: np.ndarray) -> Tuple[np.ndarray, float]:
+        height, width = gray.shape[:2]
+        if width <= self._tracking_width:
+            return gray, 1.0
+        scale = self._tracking_width / float(width)
+        resized = cv2.resize(
+            gray,
+            (self._tracking_width, max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+        return resized, scale
+
+    def _advance(self, current_gray: np.ndarray, scale: float) -> List[Detection]:
+        if self._previous_gray is None or not self._detections:
+            return list(self._detections)
+
+        all_points = []
+        point_owners: List[int] = []
+        height, width = self._previous_gray.shape[:2]
+        for index, det in enumerate(self._detections):
+            x, y, box_width, box_height = det.box
+            x1 = max(0, min(width - 1, int(round(x * scale))))
+            y1 = max(0, min(height - 1, int(round(y * scale))))
+            x2 = max(x1 + 1, min(width, int(round((x + box_width) * scale))))
+            y2 = max(y1 + 1, min(height, int(round((y + box_height) * scale))))
+            roi = self._previous_gray[y1:y2, x1:x2]
+            if roi.size == 0:
+                continue
+            points = cv2.goodFeaturesToTrack(
+                roi,
+                maxCorners=16,
+                qualityLevel=0.02,
+                minDistance=3,
+                blockSize=3,
+            )
+            if points is None:
+                continue
+            points[:, 0, 0] += x1
+            points[:, 0, 1] += y1
+            all_points.append(points)
+            point_owners.extend([index] * len(points))
+
+        if not all_points:
+            return list(self._detections)
+
+        previous_points = np.concatenate(all_points, axis=0).astype(np.float32, copy=False)
+        current_points, status, _ = cv2.calcOpticalFlowPyrLK(
+            self._previous_gray,
+            current_gray,
+            previous_points,
+            None,
+            winSize=(15, 15),
+            maxLevel=2,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03),
+        )
+        if current_points is None or status is None:
+            return list(self._detections)
+
+        moved: List[Detection] = []
+        frame_width = max(1, int(round(width / max(scale, 1e-6))))
+        frame_height = max(1, int(round(height / max(scale, 1e-6))))
+        status_flat = status.reshape(-1).astype(bool)
+        displacement = current_points.reshape(-1, 2) - previous_points.reshape(-1, 2)
+        for index, det in enumerate(self._detections):
+            owner_mask = np.asarray(point_owners) == index
+            valid = owner_mask & status_flat
+            if int(np.count_nonzero(valid)) < 2:
+                moved.append(det)
+                continue
+            dx, dy = np.median(displacement[valid], axis=0) / max(scale, 1e-6)
+            if abs(float(dx)) > det.box[2] * 1.5 or abs(float(dy)) > det.box[3] * 2.0:
+                moved.append(det)
+                continue
+            x, y, box_width, box_height = det.box
+            next_x = max(0, min(frame_width - box_width, int(round(x + dx))))
+            next_y = max(0, min(frame_height - box_height, int(round(y + dy))))
+            moved.append(
+                self._copy_with_box(
+                    det,
+                    (next_x, next_y, box_width, box_height),
+                )
+            )
+        return moved
+
+    def update(
+        self,
+        gray: np.ndarray,
+        detections: List[Detection],
+        generation: int,
+    ) -> List[Detection]:
+        current_gray, scale = self._resize_gray(gray)
+        moved = self._advance(current_gray, scale)
+
+        if generation != self._generation:
+            reconciled: List[Detection] = []
+            used = set()
+            for current in detections:
+                match_index = next(
+                    (
+                        index
+                        for index, tracked in enumerate(moved)
+                        if index not in used and self._targets_match(current, tracked)
+                    ),
+                    None,
+                )
+                if match_index is None:
+                    reconciled.append(current)
+                    continue
+                used.add(match_index)
+                reconciled.append(self._copy_with_box(current, moved[match_index].box))
+            self._detections = reconciled
+            self._generation = generation
+        else:
+            self._detections = moved
+
+        self._previous_gray = current_gray
+        return list(self._detections)
+
+
 def prepare_window(name: str, fullscreen: bool, display_width: int, display_height: int) -> None:
     cv2.namedWindow(name, cv2.WINDOW_NORMAL)
     if fullscreen:
@@ -606,7 +759,7 @@ def prepare_window(name: str, fullscreen: bool, display_width: int, display_heig
         cv2.resizeWindow(name, max(display_width, 640), max(display_height, 480))
 
 
-def open_camera(camera_index: int, width: int, height: int, backend: str) -> cv2.VideoCapture:
+def _open_video_capture(camera_index: int, width: int, height: int, backend: str) -> cv2.VideoCapture:
     if backend == "v4l2":
         cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
     elif backend == "gstreamer":
@@ -621,6 +774,87 @@ def open_camera(camera_index: int, width: int, height: int, backend: str) -> cv2
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     return cap
+
+
+class LatestFrameCamera:
+    """持续清空摄像头缓冲区，消费端始终拿到最新一帧。"""
+
+    def __init__(self, camera_index: int, width: int, height: int, backend: str) -> None:
+        self._cap = _open_video_capture(camera_index, width, height, backend)
+        self._condition = threading.Condition()
+        self._frame: np.ndarray | None = None
+        self._sequence = 0
+        self._read_sequence = 0
+        self._stopped = False
+        self._failed = False
+        self._thread: threading.Thread | None = None
+        if self._cap.isOpened():
+            self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self._thread.start()
+
+    def isOpened(self) -> bool:
+        return self._cap.isOpened() and not self._failed
+
+    def read(self) -> Tuple[bool, np.ndarray | None]:
+        deadline = time.monotonic() + 1.0
+        with self._condition:
+            while (
+                self._sequence <= self._read_sequence
+                and not self._failed
+                and not self._stopped
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False, None
+                self._condition.wait(timeout=remaining)
+
+            if self._failed or self._stopped or self._frame is None:
+                return False, None
+
+            self._read_sequence = self._sequence
+            return True, self._frame
+
+    def release(self) -> None:
+        with self._condition:
+            self._stopped = True
+            self._condition.notify_all()
+        self._cap.release()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _capture_loop(self) -> None:
+        while True:
+            with self._condition:
+                if self._stopped:
+                    return
+
+            ok, frame = self._cap.read()
+            if not ok or frame is None:
+                with self._condition:
+                    if not self._stopped:
+                        self._failed = True
+                    self._condition.notify_all()
+                return
+
+            with self._condition:
+                if self._stopped:
+                    return
+                self._frame = frame
+                self._sequence += 1
+                self._condition.notify_all()
+
+
+def open_camera(
+    camera_index: int,
+    width: int,
+    height: int,
+    backend: str,
+    *,
+    latest_frame: bool = True,
+):
+    if latest_frame:
+        return LatestFrameCamera(camera_index, width, height, backend)
+    return _open_video_capture(camera_index, width, height, backend)
 
 
 def parse_int_auto(value: str) -> int:
@@ -638,6 +872,114 @@ def choose_threshold(gray_small: np.ndarray, args: argparse.Namespace) -> int:
 
     value = max(args.threshold_min, min(args.threshold_max, value))
     return value
+
+
+class AsyncFpgaRunner:
+    """在后台处理最新 FPGA 任务，避免 PCIe 往返阻塞 HDMI 主循环。"""
+
+    def __init__(
+        self,
+        fpga: FpgaPreprocessClient,
+        args: argparse.Namespace,
+        initial_status,
+    ) -> None:
+        self._fpga = fpga
+        self._args = args
+        self._lock = threading.Lock()
+        self._pending: Tuple[np.ndarray, int] | None = None
+        self._status = initial_status
+        self._mask = np.zeros((args.fpga_height, args.fpga_width), dtype=np.uint8)
+        self._boxes: List[Tuple[int, int, int, int]] = []
+        self._threshold = int(initial_status.threshold)
+        self._configured_threshold: int | None = None
+        self._busy = False
+        self._stopped = False
+        self._submit_generation = 0
+        self._completed_generation = 0
+        self._last_duration_ms = 0.0
+        self._error: Exception | None = None
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def submit(self, gray_small: np.ndarray) -> None:
+        with self._lock:
+            self._submit_generation += 1
+            self._pending = (gray_small.copy(), self._submit_generation)
+
+    def snapshot(self):
+        with self._lock:
+            if self._error is not None:
+                raise RuntimeError(f"FPGA 后台处理失败: {self._error}") from self._error
+            return (
+                self._status,
+                self._mask.copy(),
+                list(self._boxes),
+                self._threshold,
+                self._busy,
+                self._submit_generation,
+                self._completed_generation,
+                self._last_duration_ms,
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            self._stopped = True
+        self._thread.join(timeout=1.0)
+
+    def _worker(self) -> None:
+        while True:
+            with self._lock:
+                if self._stopped:
+                    return
+                task = self._pending
+                if task is not None:
+                    self._pending = None
+                    self._busy = True
+
+            if task is None:
+                time.sleep(0.002)
+                continue
+
+            gray_small, generation = task
+            started = time.perf_counter()
+            try:
+                threshold = choose_threshold(gray_small, self._args)
+                if threshold != self._configured_threshold:
+                    self._fpga.configure(
+                        width=self._args.fpga_width,
+                        height=self._args.fpga_height,
+                        threshold=threshold,
+                        roi=(self._args.roi_x, self._args.roi_y, self._args.roi_w, self._args.roi_h),
+                        morph_cfg=self._args.morph_cfg,
+                    )
+                    self._configured_threshold = threshold
+
+                self._fpga.write_grayscale_frame(gray_small)
+                self._fpga.start()
+                status = self._fpga.wait_done()
+                raw_mask = self._fpga.read_mask(status.width, status.height)
+                mask, boxes = refine_mask(
+                    raw_mask,
+                    cleanup_mode=self._args.mask_cleanup,
+                    kernel_size=self._args.mask_kernel,
+                    min_area=self._args.mask_min_area,
+                    max_area_ratio=self._args.mask_max_area_ratio,
+                    reject_border=(not self._args.mask_keep_border),
+                )
+            except Exception as exc:
+                with self._lock:
+                    self._error = exc
+                    self._busy = False
+                return
+
+            with self._lock:
+                self._status = status
+                self._mask = mask
+                self._boxes = boxes
+                self._threshold = threshold
+                self._completed_generation = generation
+                self._last_duration_ms = (time.perf_counter() - started) * 1000.0
+                self._busy = False
 
 
 def create_hyperlpr_detector(args: argparse.Namespace) -> HyperLprDetector:
@@ -670,6 +1012,8 @@ def create_detector(args: argparse.Namespace) -> BaseDetector:
             nms_threshold=args.rknn_nms_threshold,
             core_mask=args.rknn_core_mask,
             recognizer=recognizer,
+            ocr_cache_seconds=args.rknn_ocr_cache_seconds,
+            ocr_cache_iou=args.rknn_ocr_cache_iou,
         )
     return MockDetector()
 
@@ -692,6 +1036,13 @@ def run_detector_once(
         effective_min_score = min(effective_min_score, 0.02)
 
     def detect_on_full_image(source_image: np.ndarray, target_width: int) -> List[Detection]:
+        if args.detector == "rknn":
+            return [
+                det
+                for det in detector.detect(source_image)
+                if det.score >= effective_min_score
+            ]
+
         if target_width <= 0:
             target_width = args.detector_input_width
         detector_frame, scale_x, scale_y = resize_detector_input(
@@ -880,6 +1231,7 @@ class AsyncDetectorRunner:
         self._submit_generation = 0
         self._completed_generation = 0
         self._latest_update_time = 0.0
+        self._last_duration_ms = 0.0
         self._miss_count = 0
         self._last_success_time = 0.0
         self._thread = threading.Thread(target=self._worker, daemon=True)
@@ -891,10 +1243,11 @@ class AsyncDetectorRunner:
 
         with self._lock:
             self._submit_generation += 1
-            task = (frame.copy(), list(candidate_boxes_full), self._submit_generation)
+            # 摄像头每次返回独立 ndarray；保留引用即可，避免每次提交复制整张 720p 图像。
+            task = (frame, list(candidate_boxes_full), self._submit_generation)
             self._pending = task
 
-    def snapshot(self) -> Tuple[List[Detection], str, bool, int, int, float]:
+    def snapshot(self) -> Tuple[List[Detection], str, bool, int, int, float, float]:
         with self._lock:
             return (
                 list(self._latest),
@@ -903,6 +1256,7 @@ class AsyncDetectorRunner:
                 self._submit_generation,
                 self._completed_generation,
                 self._latest_update_time,
+                self._last_duration_ms,
             )
 
     def close(self) -> None:
@@ -926,6 +1280,7 @@ class AsyncDetectorRunner:
                 continue
 
             frame, candidate_boxes_full, generation = task
+            started = time.perf_counter()
             self._submit_count += 1
             extra_roi_boxes: List[Tuple[int, int, int, int]] = []
             for det in latest_snapshot[: max(self._args.detector_max_rois, 0)]:
@@ -1001,6 +1356,7 @@ class AsyncDetectorRunner:
                     self._latest_mode = detector_mode
                     self._latest_update_time = 0.0
                     self._miss_count = 0
+                self._last_duration_ms = (time.perf_counter() - started) * 1000.0
                 self._busy = False
 
 
@@ -1018,6 +1374,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--camera-read-retries", type=parse_int_auto, default=8, help="单次掉帧后的最大重试次数")
     parser.add_argument("--camera-retry-delay", type=float, default=0.20, help="摄像头重试间隔，单位秒")
+    parser.add_argument("--camera-buffered", action="store_true", help="使用传统同步读帧；默认后台持续取最新帧以降低画面延迟")
     parser.add_argument("--fpga-width", type=parse_int_auto, default=DEFAULT_SAFE_WIDTH, help="送入 FPGA 的宽度")
     parser.add_argument("--fpga-height", type=parse_int_auto, default=DEFAULT_SAFE_HEIGHT, help="送入 FPGA 的高度")
     parser.add_argument("--threshold", type=parse_int_auto, default=128, help="固定阈值模式下的 FPGA 阈值")
@@ -1052,6 +1409,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hide-status", action="store_true", help="隐藏底部状态栏")
     parser.add_argument("--box-display-mode", choices=("hold", "flash"), default="hold", help="车牌框显示模式：hold=持续显示最近结果，flash=仅在新结果返回时闪一下")
     parser.add_argument("--box-hold-seconds", type=float, default=0.40, help="hold 模式下车牌框最多保留最近结果多少秒，越小跟随越灵敏")
+    parser.add_argument("--disable-box-tracking", action="store_true", help="关闭检测间隔内的轻量光流跟随，仅显示原始检测框")
     parser.add_argument("--detector", choices=("mock", "hyperlpr", "rknn"), default="mock", help="候选区域二阶段检测器")
     parser.add_argument("--detector-source", choices=("full", "roi", "hybrid"), default="full", help="检测器输入来源：full=全帧，roi=只跑 FPGA ROI，hybrid=先全帧后 ROI")
     parser.add_argument("--detector-interval", type=parse_int_auto, default=3, help="每隔多少帧真正跑一次检测，其他帧复用上次结果")
@@ -1082,6 +1440,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rknn-core-mask", default="auto", help="RKNN NPU core mask，例如 auto、0、1、2、0_1、0_1_2")
     parser.add_argument("--rknn-labels", default="单层车牌,双层车牌", help="RKNN 类别名称，逗号分隔")
     parser.add_argument("--rknn-disable-hyperlpr-ocr", action="store_true", help="仅用 RKNN 做车牌框检测，不复用 HyperLPR 做文字识别")
+    parser.add_argument("--rknn-ocr-cache-seconds", type=float, default=2.0, help="同一车牌成功 OCR 结果的复用时长，降低重复 CPU 推理")
+    parser.add_argument("--rknn-ocr-cache-iou", type=float, default=0.50, help="复用 OCR 结果所需的最低框 IoU")
     parser.add_argument("--mask-cleanup", choices=("off", "open", "close", "open_close"), default="open_close", help="ARM 侧对掩码做轻量清理")
     parser.add_argument("--mask-kernel", type=parse_int_auto, default=3, help="掩码清理核尺寸，建议 3 或 5")
     parser.add_argument("--mask-min-area", type=parse_int_auto, default=48, help="候选区域最小面积，单位是 FPGA 小图像素")
@@ -1149,6 +1509,10 @@ def main() -> None:
         raise ValueError("rknn-conf-threshold 必须在 0 到 1 之间")
     if not 0.0 <= args.rknn_nms_threshold <= 1.0:
         raise ValueError("rknn-nms-threshold 必须在 0 到 1 之间")
+    if args.rknn_ocr_cache_seconds < 0:
+        raise ValueError("rknn-ocr-cache-seconds 不能小于 0")
+    if not 0.0 <= args.rknn_ocr_cache_iou <= 1.0:
+        raise ValueError("rknn-ocr-cache-iou 必须在 0 到 1 之间")
 
     if args.detector_accuracy_priority:
         args.detector_min_score = min(args.detector_min_score, 0.05)
@@ -1164,7 +1528,13 @@ def main() -> None:
     detector = create_detector(args)
     detector_runner = AsyncDetectorRunner(detector, args) if args.detector != "mock" else None
     fpga = FpgaPreprocessClient(args.resource_root)
-    cap = open_camera(args.camera, args.camera_width, args.camera_height, args.camera_backend)
+    cap = open_camera(
+        args.camera,
+        args.camera_width,
+        args.camera_height,
+        args.camera_backend,
+        latest_frame=(not args.camera_buffered),
+    )
 
     if not cap.isOpened():
         if detector_runner is not None:
@@ -1194,6 +1564,7 @@ def main() -> None:
     unicode_font = resolve_text_font(args.text_font, args.text_font_size)
 
     startup_status = fpga.ensure_signature()
+    fpga_runner = AsyncFpgaRunner(fpga, args, startup_status)
     print(
         "FPGA ready:",
         f"width={startup_status.width}",
@@ -1215,6 +1586,7 @@ def main() -> None:
             f"conf={args.rknn_conf_threshold:.2f}",
             f"nms={args.rknn_nms_threshold:.2f}",
             f"ocr={'off' if args.rknn_disable_hyperlpr_ocr else 'HyperLPR'}",
+            f"ocr_cache={args.rknn_ocr_cache_seconds:.1f}s",
             flush=True,
         )
     if unicode_font is None:
@@ -1240,7 +1612,11 @@ def main() -> None:
     status_detector_mode = "idle"
     detector_busy = False
     detector_latest_update_time = 0.0
+    detector_duration_ms = 0.0
     last_detector_submit_time = 0.0
+    fpga_busy = False
+    fpga_duration_ms = 0.0
+    box_tracker = None if args.disable_box_tracking else BoxMotionTracker()
 
     try:
         while True:
@@ -1253,7 +1629,13 @@ def main() -> None:
                 )
                 cap.release()
                 time.sleep(max(args.camera_retry_delay, 0.0))
-                cap = open_camera(args.camera, args.camera_width, args.camera_height, args.camera_backend)
+                cap = open_camera(
+                    args.camera,
+                    args.camera_width,
+                    args.camera_height,
+                    args.camera_backend,
+                    latest_frame=(not args.camera_buffered),
+                )
 
                 if cap.isOpened() and camera_failures <= args.camera_read_retries:
                     continue
@@ -1266,36 +1648,23 @@ def main() -> None:
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             fpga_gray = cv2.resize(gray, (args.fpga_width, args.fpga_height), interpolation=cv2.INTER_AREA)
-
-            current_threshold = choose_threshold(fpga_gray, args)
-            if current_threshold != last_threshold:
-                fpga.configure(
-                    width=args.fpga_width,
-                    height=args.fpga_height,
-                    threshold=current_threshold,
-                    roi=(args.roi_x, args.roi_y, args.roi_w, args.roi_h),
-                    morph_cfg=args.morph_cfg,
-                )
-                last_threshold = current_threshold
-
-            fpga.write_grayscale_frame(fpga_gray)
-            fpga.start()
-            status = fpga.wait_done()
+            fpga_runner.submit(fpga_gray)
+            (
+                status,
+                mask_small,
+                candidate_boxes_small,
+                current_threshold,
+                fpga_busy,
+                _,
+                _,
+                fpga_duration_ms,
+            ) = fpga_runner.snapshot()
+            last_threshold = current_threshold
             last_status = status
-
-            raw_mask_small = fpga.read_mask(status.width, status.height)
-            mask_small, candidate_boxes_small = refine_mask(
-                raw_mask_small,
-                cleanup_mode=args.mask_cleanup,
-                kernel_size=args.mask_kernel,
-                min_area=args.mask_min_area,
-                max_area_ratio=args.mask_max_area_ratio,
-                reject_border=(not args.mask_keep_border),
-            )
             last_box_count = len(candidate_boxes_small)
 
-            sx = frame.shape[1] / max(status.width, 1)
-            sy = frame.shape[0] / max(status.height, 1)
+            sx = frame.shape[1] / max(mask_small.shape[1], 1)
+            sy = frame.shape[0] / max(mask_small.shape[0], 1)
             candidate_boxes_full = [scale_box(box, sx, sy) for box in candidate_boxes_small]
             mask_full = cv2.resize(mask_small, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
 
@@ -1350,22 +1719,30 @@ def main() -> None:
                     detector_submit_generation,
                     detector_completed_generation,
                     detector_latest_update_time,
+                    detector_duration_ms,
                 ) = detector_runner.snapshot()
             else:
                 detector_busy = False
                 detector_submit_generation = 0
                 detector_completed_generation = 0
                 detector_latest_update_time = 0.0
+                detector_duration_ms = 0.0
+
+            tracked_detections = (
+                box_tracker.update(gray, cached_detections, detector_completed_generation)
+                if box_tracker is not None
+                else list(cached_detections)
+            )
 
             if args.box_display_mode == "hold":
                 hold_age = time.monotonic() - detector_latest_update_time
                 display_detections = (
-                    list(cached_detections)
-                    if cached_detections and hold_age <= max(args.box_hold_seconds, 0.0)
+                    list(tracked_detections)
+                    if tracked_detections and hold_age <= max(args.box_hold_seconds, 0.0)
                     else []
                 )
-            elif cached_detections and detector_completed_generation > last_drawn_completed_generation:
-                display_detections = list(cached_detections)
+            elif tracked_detections and detector_completed_generation > last_drawn_completed_generation:
+                display_detections = list(tracked_detections)
                 last_drawn_completed_generation = detector_completed_generation
             else:
                 display_detections = []
@@ -1448,7 +1825,8 @@ def main() -> None:
                     f"frame={total_frames} fps={display_fps_value:.1f} real_fps={fps_value:.1f} "
                     f"threshold={last_threshold} boxes={last_box_count} plates={last_plate_count} "
                     f"mode={status_detector_mode} det={int(detector_busy)} "
-                    f"busy={int(status.busy)} done={int(status.done)} "
+                    f"busy={int(status.busy)} done={int(status.done)} fpga_async={int(fpga_busy)} "
+                    f"fpga_ms={fpga_duration_ms:.1f} det_ms={detector_duration_ms:.1f} "
                     f"active={status.active_pixels} counter={status.frame_counter} "
                     f"last_plate={last_plate_text or 'none'} "
                     f"summary={last_plate_summary or 'none'}",
@@ -1466,6 +1844,7 @@ def main() -> None:
                 break
     finally:
         cap.release()
+        fpga_runner.close()
         if detector_runner is not None:
             detector_runner.close()
         detector.close()

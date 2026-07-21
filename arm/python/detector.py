@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import ctypes
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -445,6 +448,8 @@ class RknnLiteDetector(BaseDetector):
         nms_threshold: float = 0.45,
         core_mask: str = "auto",
         recognizer: BaseDetector | None = None,
+        ocr_cache_seconds: float = 2.0,
+        ocr_cache_iou: float = 0.50,
     ) -> None:
         try:
             from rknnlite.api import RKNNLite
@@ -473,6 +478,11 @@ class RknnLiteDetector(BaseDetector):
         self._conf_threshold = float(conf_threshold)
         self._nms_threshold = float(nms_threshold)
         self._recognizer = recognizer
+        self._ocr_cache_seconds = max(0.0, float(ocr_cache_seconds))
+        self._ocr_cache_iou = min(1.0, max(0.0, float(ocr_cache_iou)))
+        self._ocr_cache: List[
+            Tuple[int, int, Tuple[int, int, int, int], float, Detection]
+        ] = []
         self._rknn = self._RKNNLite()
 
         load_status = self._rknn.load_rknn(str(self._model_path))
@@ -684,6 +694,14 @@ class RknnLiteDetector(BaseDetector):
         if self._recognizer is None:
             return None
 
+        cached = self._find_cached_recognition(
+            box,
+            image_width=image_width,
+            image_height=image_height,
+        )
+        if cached is not None:
+            return cached
+
         ox1, oy1, ox2, oy2 = self._expand_box_for_ocr(
             box,
             image_width,
@@ -691,7 +709,88 @@ class RknnLiteDetector(BaseDetector):
             ratio=0.25,
         )
         crop = frame[oy1:oy2, ox1:ox2]
-        return self._recognize_crop(crop)
+        recognized = self._recognize_crop(crop)
+        if recognized is not None:
+            self._store_cached_recognition(
+                box,
+                recognized,
+                image_width=image_width,
+                image_height=image_height,
+            )
+        return recognized
+
+    @staticmethod
+    def _box_iou_xyxy(
+        box_a: Tuple[int, int, int, int],
+        box_b: Tuple[int, int, int, int],
+    ) -> float:
+        ax1, ay1, ax2, ay2 = box_a
+        bx1, by1, bx2, by2 = box_b
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        intersection = (ix2 - ix1) * (iy2 - iy1)
+        area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+        area_b = max(1, (bx2 - bx1) * (by2 - by1))
+        return intersection / float(area_a + area_b - intersection)
+
+    def _find_cached_recognition(
+        self,
+        box: Tuple[int, int, int, int],
+        *,
+        image_width: int,
+        image_height: int,
+    ) -> Detection | None:
+        if self._ocr_cache_seconds <= 0:
+            return None
+
+        now = time.monotonic()
+        self._ocr_cache = [
+            entry
+            for entry in self._ocr_cache
+            if (now - entry[3]) <= self._ocr_cache_seconds
+        ]
+        best_iou = self._ocr_cache_iou
+        best: Detection | None = None
+        for cached_width, cached_height, cached_box, _, cached_result in self._ocr_cache:
+            if cached_width != image_width or cached_height != image_height:
+                continue
+            overlap = self._box_iou_xyxy(box, cached_box)
+            if overlap < best_iou:
+                continue
+            best_iou = overlap
+            best = cached_result
+        return best
+
+    def _store_cached_recognition(
+        self,
+        box: Tuple[int, int, int, int],
+        recognized: Detection,
+        *,
+        image_width: int,
+        image_height: int,
+    ) -> None:
+        if self._ocr_cache_seconds <= 0 or not (recognized.raw_label or recognized.label):
+            return
+
+        now = time.monotonic()
+        retained = []
+        for entry in self._ocr_cache:
+            cached_width, cached_height, cached_box, cached_time, _ = entry
+            if (now - cached_time) > self._ocr_cache_seconds:
+                continue
+            if (
+                cached_width == image_width
+                and cached_height == image_height
+                and self._box_iou_xyxy(box, cached_box) >= self._ocr_cache_iou
+            ):
+                continue
+            retained.append(entry)
+        retained.append((image_width, image_height, box, now, recognized))
+        self._ocr_cache = retained
 
     @staticmethod
     def _expand_box_for_ocr(

@@ -22,6 +22,7 @@ from fpga_client import (
     DEFAULT_SAFE_HEIGHT,
     DEFAULT_SAFE_WIDTH,
     FpgaPreprocessClient,
+    PREPROC_SOBEL,
 )
 
 
@@ -844,6 +845,31 @@ class LatestFrameCamera:
                 self._condition.notify_all()
 
 
+class StaticImageSource:
+    """将单张图片作为持续帧源，便于直接读取 SD 卡测试图片。"""
+
+    def __init__(self, image_path: str) -> None:
+        expanded_path = os.path.expandvars(os.path.expanduser(image_path))
+        self.path = Path(expanded_path).resolve()
+        if not self.path.is_file():
+            raise FileNotFoundError(f"输入图片不存在: {self.path}")
+
+        self._frame = cv2.imread(str(self.path), cv2.IMREAD_COLOR)
+        if self._frame is None:
+            raise RuntimeError(f"输入图片无法解码或格式不受支持: {self.path}")
+
+    def isOpened(self) -> bool:
+        return self._frame is not None
+
+    def read(self) -> Tuple[bool, np.ndarray | None]:
+        if self._frame is None:
+            return False, None
+        return True, self._frame.copy()
+
+    def release(self) -> None:
+        pass
+
+
 def open_camera(
     camera_index: int,
     width: int,
@@ -857,20 +883,52 @@ def open_camera(
     return _open_video_capture(camera_index, width, height, backend)
 
 
+def open_frame_source(args: argparse.Namespace):
+    if args.input_image:
+        return StaticImageSource(args.input_image)
+    return open_camera(
+        args.camera,
+        args.camera_width,
+        args.camera_height,
+        args.camera_backend,
+        latest_frame=(not args.camera_buffered),
+    )
+
+
 def parse_int_auto(value: str) -> int:
     return int(value, 0)
 
 
 def choose_threshold(gray_small: np.ndarray, args: argparse.Namespace) -> int:
+    threshold_source = gray_small
+    threshold_min = args.threshold_min
+    threshold_max = args.threshold_max
+    if args.morph_cfg & PREPROC_SOBEL:
+        # Sobel 输出的数值分布与灰度图不同，直接沿用灰度阈值会漏掉大量弱边缘。
+        denoise_mode = (args.morph_cfg >> 4) & 0x3
+        if denoise_mode == 1:
+            threshold_source = cv2.GaussianBlur(threshold_source, (3, 3), 0)
+        grad_x = cv2.Sobel(threshold_source, cv2.CV_16S, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(threshold_source, cv2.CV_16S, 0, 1, ksize=3)
+        threshold_source = np.clip(
+            np.abs(grad_x.astype(np.int32)) + np.abs(grad_y.astype(np.int32)),
+            0,
+            255,
+        ).astype(np.uint8)
+        threshold_min = args.sobel_threshold_min
+        threshold_max = args.sobel_threshold_max
+
     if args.threshold_mode == "otsu":
-        threshold_value, _ = cv2.threshold(gray_small, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        threshold_value, _ = cv2.threshold(
+            threshold_source, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
         value = int(threshold_value)
     elif args.threshold_mode == "percentile":
-        value = int(np.percentile(gray_small, args.threshold_percentile))
+        value = int(np.percentile(threshold_source, args.threshold_percentile))
     else:
         value = int(args.threshold)
 
-    value = max(args.threshold_min, min(args.threshold_max, value))
+    value = max(threshold_min, min(threshold_max, value))
     return value
 
 
@@ -1363,6 +1421,13 @@ class AsyncDetectorRunner:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RK3568 + FPGA 实时预览管线")
     parser.add_argument("--resource-root", required=True, help="PCIe 设备 sysfs 根目录")
+    parser.add_argument(
+        "--input-image",
+        "--sd-image",
+        dest="input_image",
+        default="",
+        help="从 SD 卡或本地文件系统读取单张图片；留空时继续使用摄像头",
+    )
     parser.add_argument("--camera", type=parse_int_auto, default=0, help="摄像头编号")
     parser.add_argument("--camera-width", type=parse_int_auto, default=1280, help="摄像头采集宽度")
     parser.add_argument("--camera-height", type=parse_int_auto, default=720, help="摄像头采集高度")
@@ -1382,6 +1447,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold-percentile", type=float, default=78.0, help="percentile 模式的百分位")
     parser.add_argument("--threshold-min", type=parse_int_auto, default=72, help="自适应阈值下限")
     parser.add_argument("--threshold-max", type=parse_int_auto, default=224, help="自适应阈值上限")
+    parser.add_argument("--sobel-threshold-min", type=parse_int_auto, default=24, help="FPGA Sobel 模式的自适应阈值下限")
+    parser.add_argument("--sobel-threshold-max", type=parse_int_auto, default=192, help="FPGA Sobel 模式的自适应阈值上限")
     parser.add_argument("--roi-x", type=parse_int_auto, default=0)
     parser.add_argument("--roi-y", type=parse_int_auto, default=0)
     parser.add_argument("--roi-w", type=parse_int_auto, default=0)
@@ -1528,19 +1595,13 @@ def main() -> None:
     detector = create_detector(args)
     detector_runner = AsyncDetectorRunner(detector, args) if args.detector != "mock" else None
     fpga = FpgaPreprocessClient(args.resource_root)
-    cap = open_camera(
-        args.camera,
-        args.camera_width,
-        args.camera_height,
-        args.camera_backend,
-        latest_frame=(not args.camera_buffered),
-    )
+    cap = open_frame_source(args)
 
     if not cap.isOpened():
         if detector_runner is not None:
             detector_runner.close()
         detector.close()
-        raise RuntimeError("摄像头打开失败")
+        raise RuntimeError("图片或摄像头输入源打开失败")
 
     output_dir = ensure_output_dir(args.save_dir) if args.save_dir else None
 
@@ -1565,6 +1626,10 @@ def main() -> None:
 
     startup_status = fpga.ensure_signature()
     fpga_runner = AsyncFpgaRunner(fpga, args, startup_status)
+    if args.input_image:
+        print(f"Input image ready: {Path(args.input_image).expanduser()}", flush=True)
+    else:
+        print(f"Camera ready: index={args.camera} backend={args.camera_backend}", flush=True)
     print(
         "FPGA ready:",
         f"width={startup_status.width}",
@@ -1622,6 +1687,8 @@ def main() -> None:
         while True:
             ok, frame = cap.read()
             if not ok or frame is None:
+                if args.input_image:
+                    raise RuntimeError(f"读取输入图片失败: {args.input_image}")
                 camera_failures += 1
                 print(
                     f"摄像头读帧失败，开始重试 {camera_failures}/{args.camera_read_retries} ...",
@@ -1629,13 +1696,7 @@ def main() -> None:
                 )
                 cap.release()
                 time.sleep(max(args.camera_retry_delay, 0.0))
-                cap = open_camera(
-                    args.camera,
-                    args.camera_width,
-                    args.camera_height,
-                    args.camera_backend,
-                    latest_frame=(not args.camera_buffered),
-                )
+                cap = open_frame_source(args)
 
                 if cap.isOpened() and camera_failures <= args.camera_read_retries:
                     continue

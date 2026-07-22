@@ -34,3 +34,76 @@
 2. 在 FPGA 侧先完成 BAR0 输入缓冲、BAR1 控制写入、BAR2 输出读取。
 3. 在板子 Linux 上用 `arm/python/pipeline.py` 验证摄像头、PCIe BAR、预处理和显示链路。
 4. 最后把 YOLO 模型切到 `RKNNLite` 或你手头已有的 RK3568 YOLO 推理工程。
+
+## SD 卡图片输入
+
+先在板端确认 SD 卡挂载点：
+
+```bash
+lsblk -f
+findmnt -t vfat,exfat,ext4
+```
+
+静态图片与摄像头共用同一条 FPGA、RKNN、OCR 和 HDMI 显示链路。把原命令中的
+`--camera 0` 保留或删除均可，再增加图片参数即可：
+
+```bash
+sudo -E python3 pipeline.py \
+  --resource-root /sys/bus/pci/devices/0002:21:00.0 \
+  --sd-image /media/linaro/SDCARD/test.jpg \
+  --fpga-width 112 \
+  --fpga-height 64 \
+  --morph-cfg 0x94 \
+  --threshold-mode percentile \
+  --threshold-percentile 78 \
+  --mask-cleanup off \
+  --detector rknn \
+  --detector-source full \
+  --detector-interval 1 \
+  --rknn-model /userdata/yolov8-plate/yolov8s.rknn \
+  --rknn-input-size 640 \
+  --rknn-conf-threshold 0.15 \
+  --rknn-nms-threshold 0.45 \
+  --fullscreen
+```
+
+`--sd-image` 是 `--input-image` 的别名。程序会重复处理该图片，适合对比 FPGA
+配置、检测阈值和 OCR 结果；不传该参数时仍从摄像头读取。
+
+## 二维 FPGA 预处理实验版
+
+`fpga/src/rk3568_traffic_preprocess_fpga_v2.v` 在原有 BAR 协议上增加了二维 3x3
+高斯滤波、Sobel 边缘和二维开闭运算。推荐先使用以下配置做 A/B 测试：
+
+1. `0xD0`：二维高斯 + 先开后闭，不启用 Sobel。
+2. `0x94`：二维高斯 + Sobel + 闭运算，优先保留弱车牌边缘。
+3. `0xD4`：二维高斯 + Sobel + 先开后闭，去噪更强但可能损失小车牌边缘。
+
+启用 Sobel 时，ARM 会自动根据 Sobel 幅值图计算阈值，默认限制在 24 到 192；
+可用 `--sobel-threshold-min`、`--sobel-threshold-max` 调整。硬件已经执行形态学时，
+建议加 `--mask-cleanup off`，避免 ARM 重复计算。
+
+FPGA 预处理主要改善掩码和 ROI 质量，并减少 ARM 掩码清理开销。当前
+`--detector-source full` 仍会对整帧执行 RKNN，因此总帧率提升不会等于 FPGA
+处理速度提升；确认 ROI 稳定后可测试 `--detector-source hybrid`，同时保留周期性
+全帧搜索以避免漏检。
+
+本次改动前的 Git 回退标签为 `pre-sd-fpga-pipeline-20260722`。
+
+本机 PDS 工程位于
+`D:/100H/fpga_work/fpga_demo_100h/pcie_dma_test_100h/pcie_dma_test.pds`。
+工程已加入 v2 源文件，并在
+`hdl/pcie_dma_ctrl/ips2l_pcie_dma_rx_top.v` 中将 BAR0 预处理实例切换为
+`rk3568_traffic_preprocess_fpga_v2`。旧模块仍完整保留；若板端 A/B 测试不理想，
+将该实例名改回 `rk3568_traffic_preprocess_fpga` 即可恢复旧 FPGA 行为，软件则可从
+上述 Git 标签检出原版本。
+
+PDS 2022.2-SP6.4 最终报告为 `All Constraints Met`：250 MHz `pclk` 的 WNS 为
+`+0.558 ns`，125 MHz `pclk_div2` 的 WNS 为 `+0.492 ns`。资源占用约为 LUT
+15.2%、寄存器 3.7%、DRM 44.8%。正式烧录文件为：
+
+`D:/100H/fpga_work/fpga_demo_100h/pcie_dma_test_100h/generate_bitstream/pcie_dma_test.sbit`
+
+旧版烧录文件保留在：
+
+`D:/100H/fpga_work/fpga_demo_100h/pcie_dma_test_100h/generate_bitstream/bak/pcie_dma_test.sbit`

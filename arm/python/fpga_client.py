@@ -123,6 +123,8 @@ class FpgaPreprocessClient:
         frame_bytes = width * height
         if frame_bytes <= 0:
             raise ValueError("FPGA 帧尺寸必须大于 0")
+        if width % 16 != 0:
+            raise ValueError("二维 FPGA 预处理要求宽度是 16 的整数倍")
         if frame_bytes > CURRENT_SAFE_FRAME_BYTES:
             raise ValueError(
                 "当前 FPGA 版本安全帧区只有 "

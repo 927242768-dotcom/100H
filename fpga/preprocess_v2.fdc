@@ -1,0 +1,5 @@
+# v2 运算窗口保持三个 pclk_div2 周期后再采样。
+set_multicycle_path -to [get_cells -hier {*processed_word_reg*}] -setup 3 -end
+set_multicycle_path -to [get_cells -hier {*processed_word_reg*}] -hold 2 -end
+set_multicycle_path -to [get_cells -hier {*final_word_reg*}] -setup 3 -end
+set_multicycle_path -to [get_cells -hier {*final_word_reg*}] -hold 2 -end

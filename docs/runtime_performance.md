@@ -25,6 +25,25 @@ RKNN 路线直接从摄像头原图一次 letterbox 到模型的 `640x640`，不
 
 当前常用启动命令无需增加参数即可启用最新帧、异步 FPGA、OCR 缓存和框跟随。不要添加 `--camera-buffered` 或 `--disable-box-tracking`。
 
+## 双 RKNN 模型优化
+
+车牌和行人模型同时启用时，默认通过共享锁串行调用 RK3568 的单核 NPU。锁只覆盖 `rknn.inference()`，车牌 OCR 和后处理在 CPU 执行期间，另一个模型仍可进入 NPU，从而避免两个 RKNN 上下文同时争抢 NPU。若需要与旧行为 A/B 对比，可临时增加 `--rknn-allow-concurrent-inference`。
+
+行人模型在 NMS 前只保留 COCO 类别 `0`，其余 79 类不会进入坐标恢复和 NMS。该优化不改变行人分数和框位置，同时减少后处理负担，并避免其他类别与行人做跨类别 NMS。
+
+日志中的 `person_ms` 是行人预处理、等待 NPU、推理及后处理总耗时。串行调度后应同时观察 `det_ms`、`person_ms` 和 `real_fps`，不能只比较单个模型耗时。
+
+## 摄像头高速模式
+
+部分 USB 摄像头在 `1280x720` 默认 YUYV 模式下只能输出约 5 FPS。可先执行 `v4l2-ctl --device /dev/video0 --list-formats-ext`，确认设备支持 `MJPG 1280x720` 后，在启动命令中增加：
+
+```bash
+--camera-fourcc MJPG \
+--camera-fps 30
+```
+
+启动日志会打印实际协商结果，例如 `mode=1280x720@30.0 fourcc=MJPG`。如果仍显示约 `5.0` 或格式不是 `MJPG`，说明摄像头没有接受该模式；删除这两个参数即可恢复原采集行为。
+
 ## 模型侧上限
 
 当前 `yolov8s.rknn` 由非量化 ONNX 默认转换得到，文件约 7.45 MB。若日志中的 `det_ms` 仍长期很高，下一步应使用板端真实车牌画面制作校准集并生成 INT8 RKNN：
@@ -39,4 +58,3 @@ python .\convert_plate_to_rknn.py `
 ```
 
 `calibration.txt` 每行写一张校准图片路径，建议使用 100 至 300 张来自实际摄像头、覆盖远近距离和各种车牌类型的图片。INT8 可以明显降低 NPU 推理时间，但必须用真实场景校准并对识别率做 A/B 测试，不能直接覆盖当前模型。
-

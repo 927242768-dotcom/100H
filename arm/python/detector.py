@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,9 @@ from typing import List, Sequence, Tuple
 import cv2
 
 import numpy as np
+
+
+_RKNN_INFERENCE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -450,6 +454,8 @@ class RknnLiteDetector(BaseDetector):
         recognizer: BaseDetector | None = None,
         ocr_cache_seconds: float = 2.0,
         ocr_cache_iou: float = 0.50,
+        class_filter: Sequence[int] | None = None,
+        serialize_inference: bool = True,
     ) -> None:
         try:
             from rknnlite.api import RKNNLite
@@ -477,6 +483,12 @@ class RknnLiteDetector(BaseDetector):
         self._input_size = max(32, int(input_size))
         self._conf_threshold = float(conf_threshold)
         self._nms_threshold = float(nms_threshold)
+        self._class_filter = (
+            np.asarray(sorted(set(int(item) for item in class_filter)), dtype=np.int64)
+            if class_filter
+            else None
+        )
+        self._serialize_inference = bool(serialize_inference)
         self._recognizer = recognizer
         self._ocr_cache_seconds = max(0.0, float(ocr_cache_seconds))
         self._ocr_cache_iou = min(1.0, max(0.0, float(ocr_cache_iou)))
@@ -572,7 +584,9 @@ class RknnLiteDetector(BaseDetector):
     def _prepare_input(self, image: np.ndarray) -> Tuple[np.ndarray, float, int, int]:
         letterboxed, scale, pad_x, pad_y = self._letterbox(image)
         rgb = cv2.cvtColor(letterboxed, cv2.COLOR_BGR2RGB)
-        tensor = np.expand_dims(rgb.astype(np.float32) / 255.0, axis=0)
+        tensor = rgb.astype(np.float32)
+        tensor /= 255.0
+        tensor = np.expand_dims(tensor, axis=0)
         return tensor, scale, pad_x, pad_y
 
     def _select_prediction_array(self, outputs) -> np.ndarray | None:
@@ -823,7 +837,12 @@ class RknnLiteDetector(BaseDetector):
         image_height, image_width = frame.shape[:2]
 
         input_tensor, scale, pad_x, pad_y = self._prepare_input(frame)
-        outputs = self._rknn.inference(inputs=[input_tensor])
+        if self._serialize_inference:
+            # RK3568 只有一个 NPU 核，两个模型并发调用只会产生争抢和额外延迟。
+            with _RKNN_INFERENCE_LOCK:
+                outputs = self._rknn.inference(inputs=[input_tensor])
+        else:
+            outputs = self._rknn.inference(inputs=[input_tensor])
         prediction = self._select_prediction_array(outputs)
         if prediction is None or prediction.shape[0] == 0:
             return []
@@ -832,6 +851,8 @@ class RknnLiteDetector(BaseDetector):
         scores = class_scores.max(axis=1)
         class_indices = class_scores.argmax(axis=1)
         keep_mask = scores >= self._conf_threshold
+        if self._class_filter is not None:
+            keep_mask &= np.isin(class_indices, self._class_filter)
         if not np.any(keep_mask):
             return []
 
@@ -931,6 +952,7 @@ class PersonRknnDetector(BaseDetector):
         nms_threshold: float = 0.45,
         core_mask: str = "auto",
         num_classes: int = 80,
+        serialize_inference: bool = True,
     ) -> None:
         if int(num_classes) == 1:
             labels = ("person",)
@@ -947,6 +969,8 @@ class PersonRknnDetector(BaseDetector):
             nms_threshold=nms_threshold,
             core_mask=core_mask,
             recognizer=None,
+            class_filter=(0,),
+            serialize_inference=serialize_inference,
         )
 
     def detect(self, image) -> List[Detection]:

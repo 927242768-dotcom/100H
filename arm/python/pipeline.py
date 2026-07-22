@@ -767,7 +767,14 @@ def prepare_window(name: str, fullscreen: bool, display_width: int, display_heig
         cv2.resizeWindow(name, max(display_width, 640), max(display_height, 480))
 
 
-def _open_video_capture(camera_index: int, width: int, height: int, backend: str) -> cv2.VideoCapture:
+def _open_video_capture(
+    camera_index: int,
+    width: int,
+    height: int,
+    backend: str,
+    fps: float = 0.0,
+    fourcc: str = "",
+) -> cv2.VideoCapture:
     if backend == "v4l2":
         cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
     elif backend == "gstreamer":
@@ -775,8 +782,12 @@ def _open_video_capture(camera_index: int, width: int, height: int, backend: str
     else:
         cap = cv2.VideoCapture(camera_index)
 
+    if fourcc:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc.upper()))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    if fps > 0:
+        cap.set(cv2.CAP_PROP_FPS, fps)
 
     if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -787,8 +798,22 @@ def _open_video_capture(camera_index: int, width: int, height: int, backend: str
 class LatestFrameCamera:
     """持续清空摄像头缓冲区，消费端始终拿到最新一帧。"""
 
-    def __init__(self, camera_index: int, width: int, height: int, backend: str) -> None:
-        self._cap = _open_video_capture(camera_index, width, height, backend)
+    def __init__(
+        self,
+        camera_index: int,
+        width: int,
+        height: int,
+        backend: str,
+        fps: float = 0.0,
+        fourcc: str = "",
+    ) -> None:
+        self._cap = _open_video_capture(camera_index, width, height, backend, fps, fourcc)
+        self._properties = {
+            cv2.CAP_PROP_FRAME_WIDTH: self._cap.get(cv2.CAP_PROP_FRAME_WIDTH),
+            cv2.CAP_PROP_FRAME_HEIGHT: self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
+            cv2.CAP_PROP_FPS: self._cap.get(cv2.CAP_PROP_FPS),
+            cv2.CAP_PROP_FOURCC: self._cap.get(cv2.CAP_PROP_FOURCC),
+        }
         self._condition = threading.Condition()
         self._frame: np.ndarray | None = None
         self._sequence = 0
@@ -802,6 +827,9 @@ class LatestFrameCamera:
 
     def isOpened(self) -> bool:
         return self._cap.isOpened() and not self._failed
+
+    def get(self, property_id: int) -> float:
+        return self._properties.get(property_id, 0.0)
 
     def read(self) -> Tuple[bool, np.ndarray | None]:
         deadline = time.monotonic() + 1.0
@@ -884,10 +912,12 @@ def open_camera(
     backend: str,
     *,
     latest_frame: bool = True,
+    fps: float = 0.0,
+    fourcc: str = "",
 ):
     if latest_frame:
-        return LatestFrameCamera(camera_index, width, height, backend)
-    return _open_video_capture(camera_index, width, height, backend)
+        return LatestFrameCamera(camera_index, width, height, backend, fps, fourcc)
+    return _open_video_capture(camera_index, width, height, backend, fps, fourcc)
 
 
 def open_frame_source(args: argparse.Namespace):
@@ -899,7 +929,15 @@ def open_frame_source(args: argparse.Namespace):
         args.camera_height,
         args.camera_backend,
         latest_frame=(not args.camera_buffered),
+        fps=args.camera_fps,
+        fourcc=args.camera_fourcc,
     )
+
+
+def decode_fourcc(value: float) -> str:
+    encoded = int(value)
+    text = "".join(chr((encoded >> (8 * index)) & 0xFF) for index in range(4))
+    return text if all(32 <= ord(char) <= 126 for char in text) else "unknown"
 
 
 def parse_int_auto(value: str) -> int:
@@ -1079,6 +1117,7 @@ def create_detector(args: argparse.Namespace) -> BaseDetector:
             recognizer=recognizer,
             ocr_cache_seconds=args.rknn_ocr_cache_seconds,
             ocr_cache_iou=args.rknn_ocr_cache_iou,
+            serialize_inference=(not args.rknn_allow_concurrent_inference),
         )
     return MockDetector()
 
@@ -1093,6 +1132,7 @@ def create_person_detector(args: argparse.Namespace) -> BaseDetector | None:
         nms_threshold=args.person_nms_threshold,
         core_mask=args.person_core_mask,
         num_classes=args.person_model_classes,
+        serialize_inference=(not args.rknn_allow_concurrent_inference),
     )
 
 
@@ -1525,6 +1565,8 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="摄像头后端，优先推荐 v4l2",
     )
+    parser.add_argument("--camera-fps", type=float, default=0.0, help="请求摄像头输出帧率，0 表示使用设备默认值")
+    parser.add_argument("--camera-fourcc", default="", help="请求摄像头像素格式，例如 MJPG；留空保持设备默认格式")
     parser.add_argument("--camera-read-retries", type=parse_int_auto, default=8, help="单次掉帧后的最大重试次数")
     parser.add_argument("--camera-retry-delay", type=float, default=0.20, help="摄像头重试间隔，单位秒")
     parser.add_argument("--camera-buffered", action="store_true", help="使用传统同步读帧；默认后台持续取最新帧以降低画面延迟")
@@ -1593,6 +1635,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rknn-conf-threshold", type=float, default=0.10, help="RKNN YOLO 检测置信度阈值")
     parser.add_argument("--rknn-nms-threshold", type=float, default=0.45, help="RKNN YOLO NMS 阈值")
     parser.add_argument("--rknn-core-mask", default="auto", help="RKNN NPU core mask，例如 auto、0、1、2、0_1、0_1_2")
+    parser.add_argument("--rknn-allow-concurrent-inference", action="store_true", help="允许两个 RKNN 模型并发调用 NPU；默认串行调度以避免 RK3568 单核 NPU 争抢")
     parser.add_argument("--rknn-labels", default="单层车牌,双层车牌", help="RKNN 类别名称，逗号分隔")
     parser.add_argument("--rknn-disable-hyperlpr-ocr", action="store_true", help="仅用 RKNN 做车牌框检测，不复用 HyperLPR 做文字识别")
     parser.add_argument("--rknn-ocr-cache-seconds", type=float, default=2.0, help="同一车牌成功 OCR 结果的复用时长，降低重复 CPU 推理")
@@ -1628,6 +1671,11 @@ def main() -> None:
         raise ValueError("overlay-alpha 必须在 0 到 1 之间")
     if args.mask_kernel < 1:
         raise ValueError("mask-kernel 必须大于等于 1")
+    if args.camera_fps < 0:
+        raise ValueError("camera-fps 不能小于 0")
+    args.camera_fourcc = args.camera_fourcc.strip().upper()
+    if args.camera_fourcc and len(args.camera_fourcc) != 4:
+        raise ValueError("camera-fourcc 必须是四个字符，例如 MJPG")
     if args.mask_kernel % 2 == 0:
         args.mask_kernel += 1
     if args.detector_interval < 1:
@@ -1751,7 +1799,18 @@ def main() -> None:
     if args.input_image:
         print(f"Input image ready: {Path(args.input_image).expanduser()}", flush=True)
     else:
-        print(f"Camera ready: index={args.camera} backend={args.camera_backend}", flush=True)
+        actual_width = int(round(cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        actual_height = int(round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        actual_fourcc = decode_fourcc(cap.get(cv2.CAP_PROP_FOURCC))
+        print(
+            "Camera ready:",
+            f"index={args.camera}",
+            f"backend={args.camera_backend}",
+            f"mode={actual_width}x{actual_height}@{actual_fps:.1f}",
+            f"fourcc={actual_fourcc}",
+            flush=True,
+        )
     print(
         "FPGA ready:",
         f"width={startup_status.width}",
@@ -1774,6 +1833,7 @@ def main() -> None:
             f"nms={args.rknn_nms_threshold:.2f}",
             f"ocr={'off' if args.rknn_disable_hyperlpr_ocr else 'HyperLPR'}",
             f"ocr_cache={args.rknn_ocr_cache_seconds:.1f}s",
+            f"npu_schedule={'concurrent' if args.rknn_allow_concurrent_inference else 'serialized'}",
             flush=True,
         )
     if person_detector is not None:
@@ -1784,6 +1844,7 @@ def main() -> None:
             f"conf={args.person_conf_threshold:.2f}",
             f"nms={args.person_nms_threshold:.2f}",
             f"interval={args.person_interval}",
+            f"npu_schedule={'concurrent' if args.rknn_allow_concurrent_inference else 'serialized'}",
             flush=True,
         )
     if unicode_font is None:

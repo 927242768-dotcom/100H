@@ -903,3 +903,68 @@ class RknnLiteDetector(BaseDetector):
                 self._rknn.release()
             finally:
                 self._rknn = None
+
+
+class PersonRknnDetector(BaseDetector):
+    """复用通用 YOLOv8 RKNN 后处理，只保留行人类别。"""
+
+    _COCO_LABELS = (
+        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
+        "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
+        "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
+        "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+        "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
+        "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
+        "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli",
+        "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant",
+        "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard",
+        "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book",
+        "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
+    )
+
+    def __init__(
+        self,
+        *,
+        model_path: str,
+        input_size: int = 640,
+        conf_threshold: float = 0.30,
+        nms_threshold: float = 0.45,
+        core_mask: str = "auto",
+        num_classes: int = 80,
+    ) -> None:
+        if int(num_classes) == 1:
+            labels = ("person",)
+        elif int(num_classes) == len(self._COCO_LABELS):
+            labels = self._COCO_LABELS
+        else:
+            raise ValueError("行人 RKNN 模型类别数目前只支持 1 或 80")
+
+        self._detector = RknnLiteDetector(
+            model_path=model_path,
+            labels=labels,
+            input_size=input_size,
+            conf_threshold=conf_threshold,
+            nms_threshold=nms_threshold,
+            core_mask=core_mask,
+            recognizer=None,
+        )
+
+    def detect(self, image) -> List[Detection]:
+        people: List[Detection] = []
+        for detection in self._detector.detect(image):
+            if detection.type_name != "person" and detection.label != "person":
+                continue
+            people.append(
+                Detection(
+                    label="行人",
+                    raw_label="行人",
+                    type_name="行人",
+                    full_text=f"行人 {detection.score:.0%}",
+                    score=detection.score,
+                    box=detection.box,
+                )
+            )
+        return people
+
+    def close(self) -> None:
+        self._detector.close()

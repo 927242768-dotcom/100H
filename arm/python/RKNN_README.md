@@ -184,3 +184,40 @@ sudo -E python3 pipeline.py \
 2. 在板子上抓一份真实输出张量形状
 3. 根据真实输出微调 `RknnLiteDetector` 解码
 4. 评估是否还需要把字符识别模型也转成 RKNN
+
+## 可选行人检测
+
+行人检测使用第二个独立 RKNN 模型和异步线程。默认不启用，因此原有车牌检测、HyperLPR OCR、FPGA 预处理、摄像头/SD 输入与 HDMI 显示不增加开销。启用后只保留模型中的 `person` 类，并用绿色框显示“行人 + 置信度”。
+
+当前解码器要求 Ultralytics 原始单输出模型，ONNX 输出应为 `(1, 84, 8400)`。不要直接使用 Rockchip Model Zoo 的多分支优化 ONNX。
+
+在 Windows 导出 ONNX：
+
+```powershell
+cd D:\100H\yolov8-plate
+$env:YOLO_CONFIG_DIR='D:\100H\yolov8-plate\.ultralytics'
+.\.venv\Scripts\python.exe .\export_plate_onnx.py --weights .\weights\yolov8n.pt --imgsz 640 --output-dir .\weights
+```
+
+在已安装 `rknn-toolkit2==2.3.2` 的 Linux x86_64 环境转换：
+
+```bash
+python3 tools/convert_yolov8_person_to_rknn.py \
+  --onnx /path/to/yolov8n.onnx \
+  --output /path/to/yolov8n.rknn \
+  --target rk3568
+```
+
+把模型传到板端，例如 `/userdata/yolov8-person/yolov8n.rknn`，然后在原运行命令末尾增加：
+
+```bash
+  --person-model /userdata/yolov8-person/yolov8n.rknn \
+  --person-model-classes 80 \
+  --person-input-size 640 \
+  --person-conf-threshold 0.25 \
+  --person-nms-threshold 0.45 \
+  --person-interval 3 \
+  --person-hold-seconds 0.60
+```
+
+如果使用的是只含行人的单类模型，把 `--person-model-classes` 改为 `1`。`--person-interval` 越小，跟随越及时，但会占用更多 NPU 时间；RK3568 同时运行车牌和行人两个模型时建议先从 `3` 开始实测。

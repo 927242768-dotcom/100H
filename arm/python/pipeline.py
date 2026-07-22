@@ -16,7 +16,14 @@ except ImportError:
     ImageDraw = None
     ImageFont = None
 
-from detector import BaseDetector, Detection, HyperLprDetector, MockDetector, RknnLiteDetector
+from detector import (
+    BaseDetector,
+    Detection,
+    HyperLprDetector,
+    MockDetector,
+    PersonRknnDetector,
+    RknnLiteDetector,
+)
 from fpga_client import (
     CURRENT_SAFE_FRAME_BYTES,
     DEFAULT_SAFE_HEIGHT,
@@ -1076,6 +1083,19 @@ def create_detector(args: argparse.Namespace) -> BaseDetector:
     return MockDetector()
 
 
+def create_person_detector(args: argparse.Namespace) -> BaseDetector | None:
+    if not args.person_model:
+        return None
+    return PersonRknnDetector(
+        model_path=args.person_model,
+        input_size=args.person_input_size,
+        conf_threshold=args.person_conf_threshold,
+        nms_threshold=args.person_nms_threshold,
+        core_mask=args.person_core_mask,
+        num_classes=args.person_model_classes,
+    )
+
+
 def run_detector_once(
     detector: BaseDetector,
     frame: np.ndarray,
@@ -1418,6 +1438,74 @@ class AsyncDetectorRunner:
                 self._busy = False
 
 
+class AsyncFrameDetectorRunner:
+    """为独立全帧检测器保留最新任务，避免阻塞摄像头与车牌通道。"""
+
+    def __init__(self, detector: BaseDetector) -> None:
+        self._detector = detector
+        self._lock = threading.Lock()
+        self._pending: Tuple[np.ndarray, int] | None = None
+        self._latest: List[Detection] = []
+        self._busy = False
+        self._stopped = False
+        self._submit_generation = 0
+        self._completed_generation = 0
+        self._latest_update_time = 0.0
+        self._last_duration_ms = 0.0
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def submit(self, frame: np.ndarray) -> None:
+        with self._lock:
+            self._submit_generation += 1
+            self._pending = (frame, self._submit_generation)
+
+    def snapshot(self) -> Tuple[List[Detection], bool, int, int, float, float]:
+        with self._lock:
+            return (
+                list(self._latest),
+                self._busy,
+                self._submit_generation,
+                self._completed_generation,
+                self._latest_update_time,
+                self._last_duration_ms,
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            self._stopped = True
+        self._thread.join(timeout=1.0)
+
+    def _worker(self) -> None:
+        while True:
+            with self._lock:
+                if self._stopped:
+                    return
+                task = self._pending
+                if task is not None:
+                    self._pending = None
+                    self._busy = True
+
+            if task is None:
+                time.sleep(0.005)
+                continue
+
+            frame, generation = task
+            started = time.perf_counter()
+            try:
+                detections = self._detector.detect(frame)
+            except Exception as exc:
+                print(f"行人检测失败: {exc}", flush=True)
+                detections = []
+
+            with self._lock:
+                self._latest = detections
+                self._completed_generation = generation
+                self._latest_update_time = time.monotonic()
+                self._last_duration_ms = (time.perf_counter() - started) * 1000.0
+                self._busy = False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RK3568 + FPGA 实时预览管线")
     parser.add_argument("--resource-root", required=True, help="PCIe 设备 sysfs 根目录")
@@ -1509,6 +1597,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rknn-disable-hyperlpr-ocr", action="store_true", help="仅用 RKNN 做车牌框检测，不复用 HyperLPR 做文字识别")
     parser.add_argument("--rknn-ocr-cache-seconds", type=float, default=2.0, help="同一车牌成功 OCR 结果的复用时长，降低重复 CPU 推理")
     parser.add_argument("--rknn-ocr-cache-iou", type=float, default=0.50, help="复用 OCR 结果所需的最低框 IoU")
+    parser.add_argument("--person-model", default="", help="独立行人 RKNN 模型路径；留空时完全关闭行人检测，不影响现有流程")
+    parser.add_argument("--person-model-classes", type=parse_int_auto, choices=(1, 80), default=80, help="行人模型类别数：COCO 模型填 80，单类行人模型填 1")
+    parser.add_argument("--person-input-size", type=parse_int_auto, default=640, help="行人 RKNN YOLO 输入尺寸")
+    parser.add_argument("--person-conf-threshold", type=float, default=0.30, help="行人检测置信度阈值")
+    parser.add_argument("--person-nms-threshold", type=float, default=0.45, help="行人检测 NMS 阈值")
+    parser.add_argument("--person-core-mask", default="auto", help="行人 RKNN NPU core mask")
+    parser.add_argument("--person-interval", type=parse_int_auto, default=3, help="行人模型每隔多少帧提交一次；与车牌检测异步独立")
+    parser.add_argument("--person-hold-seconds", type=float, default=0.60, help="行人检测结果在两次推理间的最大显示时长")
     parser.add_argument("--mask-cleanup", choices=("off", "open", "close", "open_close"), default="open_close", help="ARM 侧对掩码做轻量清理")
     parser.add_argument("--mask-kernel", type=parse_int_auto, default=3, help="掩码清理核尺寸，建议 3 或 5")
     parser.add_argument("--mask-min-area", type=parse_int_auto, default=48, help="候选区域最小面积，单位是 FPGA 小图像素")
@@ -1580,6 +1676,16 @@ def main() -> None:
         raise ValueError("rknn-ocr-cache-seconds 不能小于 0")
     if not 0.0 <= args.rknn_ocr_cache_iou <= 1.0:
         raise ValueError("rknn-ocr-cache-iou 必须在 0 到 1 之间")
+    if args.person_input_size < 32:
+        raise ValueError("person-input-size 不能小于 32")
+    if args.person_interval < 1:
+        raise ValueError("person-interval 必须大于等于 1")
+    if args.person_hold_seconds < 0:
+        raise ValueError("person-hold-seconds 不能小于 0")
+    if not 0.0 <= args.person_conf_threshold <= 1.0:
+        raise ValueError("person-conf-threshold 必须在 0 到 1 之间")
+    if not 0.0 <= args.person_nms_threshold <= 1.0:
+        raise ValueError("person-nms-threshold 必须在 0 到 1 之间")
 
     if args.detector_accuracy_priority:
         args.detector_min_score = min(args.detector_min_score, 0.05)
@@ -1594,6 +1700,14 @@ def main() -> None:
 
     detector = create_detector(args)
     detector_runner = AsyncDetectorRunner(detector, args) if args.detector != "mock" else None
+    try:
+        person_detector = create_person_detector(args)
+    except Exception:
+        if detector_runner is not None:
+            detector_runner.close()
+        detector.close()
+        raise
+    person_runner = AsyncFrameDetectorRunner(person_detector) if person_detector is not None else None
     fpga = FpgaPreprocessClient(args.resource_root)
     cap = open_frame_source(args)
 
@@ -1601,6 +1715,10 @@ def main() -> None:
         if detector_runner is not None:
             detector_runner.close()
         detector.close()
+        if person_runner is not None:
+            person_runner.close()
+        if person_detector is not None:
+            person_detector.close()
         raise RuntimeError("图片或摄像头输入源打开失败")
 
     output_dir = ensure_output_dir(args.save_dir) if args.save_dir else None
@@ -1613,6 +1731,10 @@ def main() -> None:
             if detector_runner is not None:
                 detector_runner.close()
             detector.close()
+            if person_runner is not None:
+                person_runner.close()
+            if person_detector is not None:
+                person_detector.close()
             cap.release()
             raise RuntimeError(
                 "未检测到 DISPLAY，无法直接输出到 HDMI。请在板端图形终端运行，"
@@ -1654,6 +1776,16 @@ def main() -> None:
             f"ocr_cache={args.rknn_ocr_cache_seconds:.1f}s",
             flush=True,
         )
+    if person_detector is not None:
+        print(
+            "Person RKNN ready:",
+            f"input_size={args.person_input_size}",
+            f"classes={args.person_model_classes}",
+            f"conf={args.person_conf_threshold:.2f}",
+            f"nms={args.person_nms_threshold:.2f}",
+            f"interval={args.person_interval}",
+            flush=True,
+        )
     if unicode_font is None:
         print("warning: 未找到可用中文字体或 Pillow，车牌中文上屏会退化为 ASCII。", flush=True)
 
@@ -1668,9 +1800,12 @@ def main() -> None:
     last_plate_count = 0
     last_plate_text = ""
     last_plate_summary = ""
+    last_person_count = 0
     cached_detections: List[Detection] = []
     display_detections: List[Detection] = []
     status_detections: List[Detection] = []
+    cached_people: List[Detection] = []
+    display_people: List[Detection] = []
     last_drawn_completed_generation = 0
     last_detector_mode = "idle"
     display_detector_mode = "idle"
@@ -1682,6 +1817,15 @@ def main() -> None:
     fpga_busy = False
     fpga_duration_ms = 0.0
     box_tracker = None if args.disable_box_tracking else BoxMotionTracker()
+    person_tracker = (
+        BoxMotionTracker()
+        if person_runner is not None and not args.disable_box_tracking
+        else None
+    )
+    person_busy = False
+    person_completed_generation = 0
+    person_latest_update_time = 0.0
+    person_duration_ms = 0.0
 
     try:
         while True:
@@ -1708,6 +1852,30 @@ def main() -> None:
                 camera_failures = 0
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if person_runner is not None and (
+                total_frames == 0 or total_frames % args.person_interval == 0
+            ):
+                person_runner.submit(frame)
+            if person_runner is not None:
+                (
+                    cached_people,
+                    person_busy,
+                    _,
+                    person_completed_generation,
+                    person_latest_update_time,
+                    person_duration_ms,
+                ) = person_runner.snapshot()
+                tracked_people = (
+                    person_tracker.update(gray, cached_people, person_completed_generation)
+                    if person_tracker is not None
+                    else list(cached_people)
+                )
+                person_result_age = time.monotonic() - person_latest_update_time
+                display_people = (
+                    list(tracked_people)
+                    if tracked_people and person_result_age <= args.person_hold_seconds
+                    else []
+                )
             fpga_gray = cv2.resize(gray, (args.fpga_width, args.fpga_height), interpolation=cv2.INTER_AREA)
             fpga_runner.submit(fpga_gray)
             (
@@ -1827,7 +1995,22 @@ def main() -> None:
                     }
                 )
 
+            for det in display_people:
+                gx1, gy1, dw, dh = det.box
+                gx2, gy2 = gx1 + dw, gy1 + dh
+                cv2.rectangle(display, (gx1, gy1), (gx2, gy2), (0, 220, 80), 2)
+                unicode_items.append(
+                    {
+                        "text": det.full_text or f"行人 {det.score:.0%}",
+                        "origin": (gx1, max(8, gy1 - args.text_font_size - 6)),
+                        "color": (0, 220, 80),
+                        "outline_color": (0, 0, 0),
+                        "outline_thickness": 2,
+                    }
+                )
+
             last_plate_count = len(status_detections)
+            last_person_count = len(cached_people)
             last_plate_text = status_detections[0].raw_label if status_detections else ""
             last_plate_summary = build_plate_summary(status_detections)
             summary_chars_per_line = max(18, int((display.shape[1] - 40) / max(args.text_font_size, 1) * 1.3))
@@ -1842,12 +2025,18 @@ def main() -> None:
                 fps_counter = 0
 
             display_fps_value = fps_value * 2.0
+            person_status_text = (
+                f"person={last_person_count} "
+                if person_runner is not None
+                else ""
+            )
             if not args.hide_status:
                 info = (
                     f"FPS:{display_fps_value:.1f} "
                     f"thr={last_threshold} "
                     f"box={last_box_count} "
                     f"plate={last_plate_count} "
+                    f"{person_status_text}"
                     f"mode={status_detector_mode} "
                     f"det={int(detector_busy)} "
                     f"active={status.active_pixels} "
@@ -1882,9 +2071,16 @@ def main() -> None:
                 print(f"saved debug images at frame {total_frames} -> {output_dir}", flush=True)
 
             if args.log_every > 0 and (total_frames == 1 or total_frames % args.log_every == 0):
+                person_log_text = (
+                    f"persons={last_person_count} person_det={int(person_busy)} "
+                    f"person_ms={person_duration_ms:.1f} "
+                    if person_runner is not None
+                    else ""
+                )
                 print(
                     f"frame={total_frames} fps={display_fps_value:.1f} real_fps={fps_value:.1f} "
                     f"threshold={last_threshold} boxes={last_box_count} plates={last_plate_count} "
+                    f"{person_log_text}"
                     f"mode={status_detector_mode} det={int(detector_busy)} "
                     f"busy={int(status.busy)} done={int(status.done)} fpga_async={int(fpga_busy)} "
                     f"fpga_ms={fpga_duration_ms:.1f} det_ms={detector_duration_ms:.1f} "
@@ -1909,13 +2105,23 @@ def main() -> None:
         if detector_runner is not None:
             detector_runner.close()
         detector.close()
+        if person_runner is not None:
+            person_runner.close()
+        if person_detector is not None:
+            person_detector.close()
         fpga.close()
         cv2.destroyAllWindows()
+        person_final_text = (
+            f"last_person_count={last_person_count} "
+            if person_runner is not None
+            else ""
+        )
         print(
             f"pipeline finished: frames={total_frames} "
             f"last_threshold={last_threshold} "
             f"last_boxes={last_box_count} "
             f"last_plate_count={last_plate_count} "
+            f"{person_final_text}"
             f"last_plate={last_plate_text or 'none'} "
             f"last_plate_summary={last_plate_summary or 'none'} "
             f"last_mode={display_detector_mode} "

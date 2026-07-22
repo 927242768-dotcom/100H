@@ -1234,6 +1234,14 @@ def create_person_detector(args: argparse.Namespace) -> BaseDetector | None:
         core_mask=args.person_core_mask,
         num_classes=args.person_model_classes,
         serialize_inference=(not args.rknn_allow_concurrent_inference),
+        class_margin_threshold=args.person_class_margin,
+        confirmation_hits=args.person_confirmation_hits,
+        confirmation_threshold=args.person_confirmation_threshold,
+        instant_threshold=args.person_instant_threshold,
+        match_iou=args.person_confirmation_iou,
+        min_height_ratio=args.person_min_height_ratio,
+        max_width_height_ratio=args.person_max_width_height_ratio,
+        temporal_confirmation=(not args.person_disable_confirmation),
     )
 
 
@@ -1761,6 +1769,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--person-core-mask", default="auto", help="行人 RKNN NPU core mask")
     parser.add_argument("--person-interval", type=parse_int_auto, default=3, help="行人模型每隔多少帧提交一次；与车牌检测异步独立")
     parser.add_argument("--person-hold-seconds", type=float, default=0.60, help="行人检测结果在两次推理间的最大显示时长")
+    parser.add_argument("--person-class-margin", type=float, default=0.08, help="person 分数领先第二类别的最小差值，用于剔除类别模糊物体")
+    parser.add_argument("--person-confirmation-hits", type=parse_int_auto, default=2, help="中等置信度行人上屏前需要连续命中的次数")
+    parser.add_argument("--person-confirmation-threshold", type=float, default=0.48, help="连续确认行人的最低平均置信度")
+    parser.add_argument("--person-instant-threshold", type=float, default=0.72, help="无需连续确认即可立即上屏的高置信度阈值")
+    parser.add_argument("--person-confirmation-iou", type=float, default=0.25, help="相邻两次行人结果判定为同一目标的最低 IoU")
+    parser.add_argument("--person-min-height-ratio", type=float, default=0.04, help="行人框最小高度占画面比例，用于过滤极小噪声框")
+    parser.add_argument("--person-max-width-height-ratio", type=float, default=1.30, help="行人框最大宽高比，用于过滤明显横向物体；0 表示关闭")
+    parser.add_argument("--person-disable-confirmation", action="store_true", help="关闭行人连续确认，仅用于 A/B 对比")
     parser.add_argument("--mask-cleanup", choices=("off", "open", "close", "open_close"), default="open_close", help="ARM 侧对掩码做轻量清理")
     parser.add_argument("--mask-kernel", type=parse_int_auto, default=3, help="掩码清理核尺寸，建议 3 或 5")
     parser.add_argument("--mask-min-area", type=parse_int_auto, default=48, help="候选区域最小面积，单位是 FPGA 小图像素")
@@ -1847,6 +1863,20 @@ def main() -> None:
         raise ValueError("person-conf-threshold 必须在 0 到 1 之间")
     if not 0.0 <= args.person_nms_threshold <= 1.0:
         raise ValueError("person-nms-threshold 必须在 0 到 1 之间")
+    if not 0.0 <= args.person_class_margin <= 1.0:
+        raise ValueError("person-class-margin 必须在 0 到 1 之间")
+    if args.person_confirmation_hits < 1:
+        raise ValueError("person-confirmation-hits 必须大于等于 1")
+    if not 0.0 <= args.person_confirmation_threshold <= 1.0:
+        raise ValueError("person-confirmation-threshold 必须在 0 到 1 之间")
+    if not 0.0 <= args.person_instant_threshold <= 1.0:
+        raise ValueError("person-instant-threshold 必须在 0 到 1 之间")
+    if not 0.0 <= args.person_confirmation_iou <= 1.0:
+        raise ValueError("person-confirmation-iou 必须在 0 到 1 之间")
+    if not 0.0 <= args.person_min_height_ratio <= 1.0:
+        raise ValueError("person-min-height-ratio 必须在 0 到 1 之间")
+    if args.person_max_width_height_ratio < 0.0:
+        raise ValueError("person-max-width-height-ratio 必须大于等于 0")
 
     if args.detector_accuracy_priority:
         args.detector_min_score = min(args.detector_min_score, 0.05)
@@ -1957,6 +1987,9 @@ def main() -> None:
             f"conf={args.person_conf_threshold:.2f}",
             f"nms={args.person_nms_threshold:.2f}",
             f"interval={args.person_interval}",
+            f"margin={args.person_class_margin:.2f}",
+            f"confirm={args.person_confirmation_hits}x@{args.person_confirmation_threshold:.2f}",
+            f"instant={args.person_instant_threshold:.2f}",
             f"npu_schedule={'concurrent' if args.rknn_allow_concurrent_inference else 'serialized'}",
             flush=True,
         )

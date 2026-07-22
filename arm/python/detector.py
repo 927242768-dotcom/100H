@@ -457,6 +457,7 @@ class RknnLiteDetector(BaseDetector):
         class_filter: Sequence[int] | None = None,
         serialize_inference: bool = True,
         refine_box_from_recognizer: bool = True,
+        class_margin_threshold: float = 0.0,
     ) -> None:
         try:
             from rknnlite.api import RKNNLite
@@ -498,6 +499,7 @@ class RknnLiteDetector(BaseDetector):
             if class_filter
             else None
         )
+        self._class_margin_threshold = max(0.0, float(class_margin_threshold))
         self._serialize_inference = bool(serialize_inference)
         self._recognizer = recognizer
         self._refine_box_from_recognizer = bool(refine_box_from_recognizer)
@@ -939,6 +941,15 @@ class RknnLiteDetector(BaseDetector):
         keep_mask = scores >= self._conf_threshold
         if self._class_filter is not None:
             keep_mask &= np.isin(class_indices, self._class_filter)
+        if self._class_margin_threshold > 0.0 and self._num_classes > 1:
+            candidate_indices = np.flatnonzero(keep_mask)
+            if candidate_indices.size > 0:
+                candidate_scores = class_scores[candidate_indices].copy()
+                candidate_classes = class_indices[candidate_indices]
+                candidate_scores[np.arange(candidate_indices.size), candidate_classes] = -np.inf
+                runner_up_scores = candidate_scores.max(axis=1)
+                class_margins = scores[candidate_indices] - runner_up_scores
+                keep_mask[candidate_indices] = class_margins >= self._class_margin_threshold
         if not np.any(keep_mask):
             return []
 
@@ -1012,6 +1023,14 @@ class RknnLiteDetector(BaseDetector):
                 self._rknn = None
 
 
+@dataclass
+class _PersonTrack:
+    detection: Detection
+    hits: int
+    score_sum: float
+    confirmed: bool
+
+
 class PersonRknnDetector(BaseDetector):
     """复用通用 YOLOv8 RKNN 后处理，只保留行人类别。"""
 
@@ -1039,6 +1058,14 @@ class PersonRknnDetector(BaseDetector):
         core_mask: str = "auto",
         num_classes: int = 80,
         serialize_inference: bool = True,
+        class_margin_threshold: float = 0.08,
+        confirmation_hits: int = 2,
+        confirmation_threshold: float = 0.48,
+        instant_threshold: float = 0.72,
+        match_iou: float = 0.25,
+        min_height_ratio: float = 0.04,
+        max_width_height_ratio: float = 1.30,
+        temporal_confirmation: bool = True,
     ) -> None:
         if int(num_classes) == 1:
             labels = ("person",)
@@ -1046,6 +1073,15 @@ class PersonRknnDetector(BaseDetector):
             labels = self._COCO_LABELS
         else:
             raise ValueError("行人 RKNN 模型类别数目前只支持 1 或 80")
+
+        self._confirmation_hits = max(1, int(confirmation_hits))
+        self._confirmation_threshold = min(1.0, max(0.0, float(confirmation_threshold)))
+        self._instant_threshold = min(1.0, max(0.0, float(instant_threshold)))
+        self._match_iou = min(1.0, max(0.0, float(match_iou)))
+        self._min_height_ratio = min(1.0, max(0.0, float(min_height_ratio)))
+        self._max_width_height_ratio = max(0.0, float(max_width_height_ratio))
+        self._temporal_confirmation = bool(temporal_confirmation)
+        self._tracks: List[_PersonTrack] = []
 
         self._detector = RknnLiteDetector(
             model_path=model_path,
@@ -1057,12 +1093,110 @@ class PersonRknnDetector(BaseDetector):
             recognizer=None,
             class_filter=(0,),
             serialize_inference=serialize_inference,
+            class_margin_threshold=(class_margin_threshold if int(num_classes) > 1 else 0.0),
         )
+
+    @staticmethod
+    def _box_iou(box_a: Tuple[int, int, int, int], box_b: Tuple[int, int, int, int]) -> float:
+        ax, ay, aw, ah = box_a
+        bx, by, bw, bh = box_b
+        ix1 = max(ax, bx)
+        iy1 = max(ay, by)
+        ix2 = min(ax + aw, bx + bw)
+        iy2 = min(ay + ah, by + bh)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        intersection = (ix2 - ix1) * (iy2 - iy1)
+        union = max(1, aw * ah + bw * bh - intersection)
+        return intersection / float(union)
+
+    def _same_person(self, current: Detection, previous: Detection) -> bool:
+        if self._box_iou(current.box, previous.box) >= self._match_iou:
+            return True
+
+        cx, cy, cw, ch = current.box
+        px, py, pw, ph = previous.box
+        current_center = (cx + cw * 0.5, cy + ch * 0.5)
+        previous_center = (px + pw * 0.5, py + ph * 0.5)
+        center_distance = (
+            (current_center[0] - previous_center[0]) ** 2
+            + (current_center[1] - previous_center[1]) ** 2
+        ) ** 0.5
+        area_ratio = (cw * ch) / float(max(1, pw * ph))
+        return 0.45 <= area_ratio <= 2.20 and center_distance <= max(cw, ch, pw, ph) * 0.55
+
+    def _passes_geometry(self, detection: Detection, image_width: int, image_height: int) -> bool:
+        _, _, width, height = detection.box
+        if width < 2 or height < 2:
+            return False
+        if height / float(max(1, image_height)) < self._min_height_ratio:
+            return False
+        if self._max_width_height_ratio > 0 and width / float(height) > self._max_width_height_ratio:
+            return False
+        return True
+
+    def _confirm_people(self, detections: List[Detection]) -> List[Detection]:
+        if not self._temporal_confirmation or self._confirmation_hits <= 1:
+            self._tracks = []
+            return detections
+
+        next_tracks: List[_PersonTrack] = []
+        confirmed_people: List[Detection] = []
+        used_previous = set()
+        for detection in detections:
+            match_index = next(
+                (
+                    index
+                    for index, track in enumerate(self._tracks)
+                    if index not in used_previous and self._same_person(detection, track.detection)
+                ),
+                None,
+            )
+            if match_index is None:
+                hits = 1
+                score_sum = detection.score
+                was_confirmed = False
+            else:
+                used_previous.add(match_index)
+                previous = self._tracks[match_index]
+                hits = previous.hits + 1
+                score_sum = previous.score_sum + detection.score
+                was_confirmed = previous.confirmed
+
+            average_score = score_sum / float(hits)
+            confirmed = (
+                was_confirmed
+                or detection.score >= self._instant_threshold
+                or (
+                    hits >= self._confirmation_hits
+                    and average_score >= self._confirmation_threshold
+                )
+            )
+            next_tracks.append(
+                _PersonTrack(
+                    detection=detection,
+                    hits=hits,
+                    score_sum=score_sum,
+                    confirmed=confirmed,
+                )
+            )
+            if confirmed:
+                confirmed_people.append(detection)
+
+        self._tracks = next_tracks
+        return confirmed_people
 
     def detect(self, image) -> List[Detection]:
         people: List[Detection] = []
+        image_array = np.asarray(image)
+        if image_array.ndim < 2:
+            self._tracks = []
+            return people
+        image_height, image_width = image_array.shape[:2]
         for detection in self._detector.detect(image):
             if detection.type_name != "person" and detection.label != "person":
+                continue
+            if not self._passes_geometry(detection, image_width, image_height):
                 continue
             people.append(
                 Detection(
@@ -1074,7 +1208,8 @@ class PersonRknnDetector(BaseDetector):
                     box=detection.box,
                 )
             )
-        return people
+        return self._confirm_people(people)
 
     def close(self) -> None:
+        self._tracks = []
         self._detector.close()

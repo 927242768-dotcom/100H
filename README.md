@@ -75,6 +75,11 @@ sudo -E python3 pipeline.py \
 主程序现已支持 `--input-video/--sd-video`、视频原速或极速测试、循环播放，以及CSV/JSON指标输出。
 完整部署命令、标注格式和指标说明见 `docs/sd_video_metrics.md`。
 
+## 行人违法行为标记
+
+可选的机动车道/禁入区判定会对进入区域的行人连续确认，并在HDMI、日志和自动测试结果中标记违法行为。
+完整参数和区域标定方法见 `docs/pedestrian_violation.md`。
+
 ## 二维 FPGA 预处理实验版
 
 `fpga/src/rk3568_traffic_preprocess_fpga_v2.v` 在原有 BAR 协议上增加了二维 3x3

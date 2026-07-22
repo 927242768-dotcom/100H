@@ -32,6 +32,7 @@ from fpga_client import (
     PREPROC_SOBEL,
 )
 from evaluation_metrics import MetricsRecorder
+from pedestrian_violation import PedestrianViolationMonitor, parse_zone_points
 
 
 _UNICODE_TEXT_CACHE: Dict[Tuple[int, str, Tuple[int, int, int], Tuple[int, int, int], int], Tuple[np.ndarray, int, int]] = {}
@@ -1971,6 +1972,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--person-min-height-ratio", type=float, default=0.04, help="行人框最小高度占画面比例，用于过滤极小噪声框")
     parser.add_argument("--person-max-width-height-ratio", type=float, default=1.30, help="行人框最大宽高比，用于过滤明显横向物体；0 表示关闭")
     parser.add_argument("--person-disable-confirmation", action="store_true", help="关闭行人连续确认，仅用于 A/B 对比")
+    parser.add_argument("--enable-pedestrian-violation", action="store_true", help="启用行人进入机动车道/禁入区违法标记")
+    parser.add_argument(
+        "--pedestrian-zone",
+        default="",
+        help="违法区域多边形，格式 x,y;x,y;...；留空使用画面下半部默认梯形",
+    )
+    parser.add_argument(
+        "--pedestrian-zone-coordinates",
+        choices=("normalized", "pixels"),
+        default="normalized",
+        help="违法区域坐标类型：normalized=0到1归一化坐标，pixels=画面像素",
+    )
+    parser.add_argument("--pedestrian-violation-confirmations", type=parse_int_auto, default=2, help="连续多少次检测脚点位于违法区才告警")
+    parser.add_argument("--pedestrian-violation-clear-hits", type=parse_int_auto, default=2, help="连续多少次检测离开违法区后解除告警")
+    parser.add_argument("--pedestrian-violation-match-iou", type=float, default=0.15, help="违法行为时序轨迹匹配的最低IoU")
+    parser.add_argument("--pedestrian-violation-hold-seconds", type=float, default=0.75, help="检测短暂中断时违法轨迹的最大保留时间")
+    parser.add_argument("--pedestrian-foot-y-ratio", type=float, default=0.95, help="行人框内脚点纵向位置比例，建议0.85到1.0")
+    parser.add_argument("--hide-pedestrian-zone", action="store_true", help="不绘制机动车道/行人禁入区多边形")
     parser.add_argument("--mask-cleanup", choices=("off", "open", "close", "open_close"), default="open_close", help="ARM 侧对掩码做轻量清理")
     parser.add_argument("--mask-kernel", type=parse_int_auto, default=3, help="掩码清理核尺寸，建议 3 或 5")
     parser.add_argument("--mask-min-area", type=parse_int_auto, default=48, help="候选区域最小面积，单位是 FPGA 小图像素")
@@ -2079,6 +2098,19 @@ def main() -> None:
         raise ValueError("person-min-height-ratio 必须在 0 到 1 之间")
     if args.person_max_width_height_ratio < 0.0:
         raise ValueError("person-max-width-height-ratio 必须大于等于 0")
+    if args.enable_pedestrian_violation and not args.person_model:
+        raise ValueError("启用行人违法标记时必须通过 --person-model 指定行人RKNN模型")
+    if args.pedestrian_violation_confirmations < 1:
+        raise ValueError("pedestrian-violation-confirmations 必须大于等于 1")
+    if args.pedestrian_violation_clear_hits < 1:
+        raise ValueError("pedestrian-violation-clear-hits 必须大于等于 1")
+    if not 0.0 <= args.pedestrian_violation_match_iou <= 1.0:
+        raise ValueError("pedestrian-violation-match-iou 必须在 0 到 1 之间")
+    if args.pedestrian_violation_hold_seconds < 0.0:
+        raise ValueError("pedestrian-violation-hold-seconds 不能小于 0")
+    if not 0.5 <= args.pedestrian_foot_y_ratio <= 1.0:
+        raise ValueError("pedestrian-foot-y-ratio 必须在 0.5 到 1.0 之间")
+    args.pedestrian_zone_points = parse_zone_points(args.pedestrian_zone)
 
     if args.detector_accuracy_priority:
         args.detector_min_score = min(args.detector_min_score, 0.05)
@@ -2206,6 +2238,15 @@ def main() -> None:
             f"npu_schedule={'concurrent' if args.rknn_allow_concurrent_inference else 'serialized'}",
             flush=True,
         )
+    if args.enable_pedestrian_violation:
+        print(
+            "Pedestrian violation ready:",
+            f"zone={args.pedestrian_zone or 'default-road-trapezoid'}",
+            f"coordinates={args.pedestrian_zone_coordinates}",
+            f"confirmations={args.pedestrian_violation_confirmations}",
+            f"clear_hits={args.pedestrian_violation_clear_hits}",
+            flush=True,
+        )
     if unicode_font is None:
         print("warning: 未找到可用中文字体或 Pillow，车牌中文上屏会退化为 ASCII。", flush=True)
 
@@ -2242,10 +2283,25 @@ def main() -> None:
         if person_runner is not None and not args.disable_box_tracking
         else None
     )
+    violation_monitor = (
+        PedestrianViolationMonitor(
+            args.pedestrian_zone_points,
+            normalized=(args.pedestrian_zone_coordinates == "normalized"),
+            confirmation_hits=args.pedestrian_violation_confirmations,
+            clear_hits=args.pedestrian_violation_clear_hits,
+            match_iou=args.pedestrian_violation_match_iou,
+            hold_seconds=args.pedestrian_violation_hold_seconds,
+            foot_y_ratio=args.pedestrian_foot_y_ratio,
+        )
+        if args.enable_pedestrian_violation
+        else None
+    )
     person_busy = False
     person_completed_generation = 0
     person_latest_update_time = 0.0
     person_duration_ms = 0.0
+    last_violation_count = 0
+    display_violations: List[Detection] = []
     source_description = describe_frame_source(cap, args)
     metrics_recorder = (
         MetricsRecorder(
@@ -2297,6 +2353,7 @@ def main() -> None:
             )
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            display_violations = []
             if person_runner is not None and (
                 total_frames == 0 or total_frames % args.person_interval == 0
             ):
@@ -2321,6 +2378,19 @@ def main() -> None:
                     if tracked_people and person_result_age <= args.person_hold_seconds
                     else []
                 )
+                if violation_monitor is not None:
+                    violation_now = time.monotonic()
+                    violation_monitor.update(
+                        cached_people,
+                        person_completed_generation,
+                        frame.shape[1],
+                        frame.shape[0],
+                        now=violation_now,
+                    )
+                    display_people, display_violations = violation_monitor.annotate(
+                        display_people,
+                        now=violation_now,
+                    )
             fpga_gray = cv2.resize(gray, (args.fpga_width, args.fpga_height), interpolation=cv2.INTER_AREA)
             fpga_runner.submit(fpga_gray)
             (
@@ -2352,6 +2422,17 @@ def main() -> None:
                 args.display_mode,
                 args.overlay_alpha,
             )
+
+            if (
+                violation_monitor is not None
+                and not args.hide_pedestrian_zone
+                and violation_monitor.zone_pixels
+            ):
+                zone_contour = np.asarray(
+                    violation_monitor.zone_pixels,
+                    dtype=np.int32,
+                ).reshape((-1, 1, 2))
+                cv2.polylines(display, [zone_contour], True, (0, 165, 255), 2)
 
             if args.draw_roi:
                 draw_candidate_boxes(display, candidate_boxes_full)
@@ -2463,6 +2544,21 @@ def main() -> None:
                 status_detector_mode = last_detector_mode
 
             unicode_items = []
+            if (
+                violation_monitor is not None
+                and not args.hide_pedestrian_zone
+                and violation_monitor.zone_pixels
+            ):
+                zone_x, zone_y = violation_monitor.zone_pixels[0]
+                unicode_items.append(
+                    {
+                        "text": "机动车道 / 行人禁入区",
+                        "origin": (zone_x + 6, max(8, zone_y + 6)),
+                        "color": (0, 165, 255),
+                        "outline_color": (0, 0, 0),
+                        "outline_thickness": 2,
+                    }
+                )
             for det in display_detections:
                 gx1, gy1, dw, dh = det.box
                 gx2, gy2 = gx1 + dw, gy1 + dh
@@ -2480,19 +2576,39 @@ def main() -> None:
             for det in display_people:
                 gx1, gy1, dw, dh = det.box
                 gx2, gy2 = gx1 + dw, gy1 + dh
-                cv2.rectangle(display, (gx1, gy1), (gx2, gy2), (0, 220, 80), 2)
+                is_violation = det.type_name == "行人违法"
+                person_color = (0, 64, 255) if is_violation else (0, 220, 80)
+                cv2.rectangle(
+                    display,
+                    (gx1, gy1),
+                    (gx2, gy2),
+                    person_color,
+                    3 if is_violation else 2,
+                )
                 unicode_items.append(
                     {
                         "text": det.full_text or f"行人 {det.score:.0%}",
                         "origin": (gx1, max(8, gy1 - args.text_font_size - 6)),
-                        "color": (0, 220, 80),
+                        "color": person_color,
                         "outline_color": (0, 0, 0),
                         "outline_thickness": 2,
                     }
                 )
 
+            if display_violations:
+                unicode_items.append(
+                    {
+                        "text": f"违法告警：{len(display_violations)}名行人进入机动车道",
+                        "origin": (20, 18),
+                        "color": (0, 64, 255),
+                        "outline_color": (0, 0, 0),
+                        "outline_thickness": 3,
+                    }
+                )
+
             last_plate_count = len(status_detections)
             last_person_count = len(cached_people)
+            last_violation_count = len(display_violations)
             last_plate_text = status_detections[0].raw_label if status_detections else ""
             last_plate_summary = build_plate_summary(status_detections)
             summary_chars_per_line = max(18, int((display.shape[1] - 40) / max(args.text_font_size, 1) * 1.3))
@@ -2529,6 +2645,7 @@ def main() -> None:
                     candidate_boxes=last_box_count,
                     plates=display_detections,
                     people=display_people,
+                    violations=display_violations,
                     detector_mode=status_detector_mode,
                     detector_busy=detector_busy,
                     fpga_busy=fpga_busy,
@@ -2562,6 +2679,11 @@ def main() -> None:
                 if person_runner is not None
                 else ""
             )
+            violation_status_text = (
+                f"violation={last_violation_count} "
+                if violation_monitor is not None
+                else ""
+            )
             if not args.hide_status:
                 info = (
                     f"FPS:{display_fps_value:.1f} "
@@ -2569,6 +2691,7 @@ def main() -> None:
                     f"box={last_box_count} "
                     f"plate={last_plate_count} "
                     f"{person_status_text}"
+                    f"{violation_status_text}"
                     f"mode={status_detector_mode} "
                     f"det={int(detector_busy)} "
                     f"active={status.active_pixels} "
@@ -2616,10 +2739,16 @@ def main() -> None:
                     if person_runner is not None
                     else ""
                 )
+                violation_log_text = (
+                    f"violations={last_violation_count} "
+                    if violation_monitor is not None
+                    else ""
+                )
                 print(
                     f"frame={total_frames} fps={display_fps_value:.1f} real_fps={fps_value:.1f} "
                     f"threshold={last_threshold} boxes={last_box_count} plates={last_plate_count} "
                     f"{person_log_text}"
+                    f"{violation_log_text}"
                     f"mode={status_detector_mode} det={int(detector_busy)} "
                     f"busy={int(status.busy)} done={int(status.done)} fpga_async={int(fpga_busy)} "
                     f"fpga_ms={fpga_duration_ms:.1f} det_ms={detector_duration_ms:.1f} "
@@ -2661,12 +2790,18 @@ def main() -> None:
             if person_runner is not None
             else ""
         )
+        violation_final_text = (
+            f"last_violation_count={last_violation_count} "
+            if violation_monitor is not None
+            else ""
+        )
         print(
             f"pipeline finished: frames={total_frames} "
             f"last_threshold={last_threshold} "
             f"last_boxes={last_box_count} "
             f"last_plate_count={last_plate_count} "
             f"{person_final_text}"
+            f"{violation_final_text}"
             f"last_plate={last_plate_text or 'none'} "
             f"last_plate_summary={last_plate_summary or 'none'} "
             f"last_mode={display_detector_mode} "

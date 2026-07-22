@@ -88,8 +88,8 @@ sudo -E python3 pipeline.py \
 
 指定 `--metrics-dir` 后自动生成：
 
-- `frames.csv`：逐帧源时间、真实FPS、候选框数、车牌数、行人数和各阶段耗时。
-- `detections.csv`：检测框、置信度、OCR文字、车牌类型及标注匹配结果。
+- `frames.csv`：逐帧源时间、真实FPS、候选框数、车牌数、行人数、违法数和各阶段耗时。
+- `detections.csv`：车牌、行人、违法行为检测框、置信度、OCR文字、车牌类型及标注匹配结果。
 - `summary.json`：吞吐率、FPGA/车牌/行人延迟P50/P95、OCR输出率及可选准确率。
 
 CSV使用UTF-8 BOM编码，可直接使用Excel打开。

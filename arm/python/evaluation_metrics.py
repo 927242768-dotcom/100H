@@ -185,6 +185,7 @@ class MetricsRecorder:
         "candidate_boxes",
         "plate_count",
         "person_count",
+        "violation_count",
         "detector_mode",
         "detector_busy",
         "fpga_busy",
@@ -249,6 +250,8 @@ class MetricsRecorder:
         self._detector_events = 0
         self._plate_output_frames = 0
         self._max_plate_count = 0
+        self._violation_output_frames = 0
+        self._violation_rows = 0
         self._plate_rows = 0
         self._recognized_rows = 0
         self._unique_plate_texts: set[str] = set()
@@ -312,6 +315,7 @@ class MetricsRecorder:
         candidate_boxes: int,
         plates: Sequence[Any],
         people: Sequence[Any],
+        violations: Sequence[Any],
         detector_mode: str,
         detector_busy: bool,
         fpga_busy: bool,
@@ -352,6 +356,9 @@ class MetricsRecorder:
 
         if plates:
             self._plate_output_frames += 1
+        if violations:
+            self._violation_output_frames += 1
+            self._violation_rows += len(violations)
         self._max_plate_count = max(self._max_plate_count, len(plates))
 
         evaluation_plates = list(detector_result) if detector_updated else []
@@ -385,6 +392,7 @@ class MetricsRecorder:
                 "candidate_boxes": candidate_boxes,
                 "plate_count": len(plates),
                 "person_count": len(people),
+                "violation_count": len(violations),
                 "detector_mode": detector_mode,
                 "detector_busy": int(detector_busy),
                 "fpga_busy": int(fpga_busy),
@@ -406,6 +414,7 @@ class MetricsRecorder:
         detection_groups = (
             ("plate", evaluation_plates),
             ("person", people if person_updated else []),
+            ("violation", violations),
         )
         for kind, detections in detection_groups:
             for detection_index, detection in enumerate(detections):
@@ -506,6 +515,8 @@ class MetricsRecorder:
                 "ocr_text_rows": self._recognized_rows,
                 "ocr_output_rate": self._recognized_rows / max(self._plate_rows, 1),
                 "unique_plate_texts": sorted(self._unique_plate_texts),
+                "pedestrian_violation_output_frames": self._violation_output_frames,
+                "pedestrian_violation_rows": self._violation_rows,
             },
             "latency": {
                 "pipeline_frame_interval": _latency_summary(self._frame_intervals),

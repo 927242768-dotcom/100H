@@ -92,6 +92,7 @@ class MetricsRecorderTest(unittest.TestCase):
                 "threshold": 128,
                 "candidate_boxes": 1,
                 "people": [],
+                "violations": [],
                 "detector_mode": "full",
                 "detector_busy": False,
                 "fpga_busy": False,

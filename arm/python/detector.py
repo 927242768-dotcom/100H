@@ -456,6 +456,7 @@ class RknnLiteDetector(BaseDetector):
         ocr_cache_iou: float = 0.50,
         class_filter: Sequence[int] | None = None,
         serialize_inference: bool = True,
+        refine_box_from_recognizer: bool = True,
     ) -> None:
         try:
             from rknnlite.api import RKNNLite
@@ -481,6 +482,15 @@ class RknnLiteDetector(BaseDetector):
             self._labels = ["单层车牌", "双层车牌"]
         self._num_classes = len(self._labels)
         self._input_size = max(32, int(input_size))
+        self._letterbox_canvas = np.empty(
+            (self._input_size, self._input_size, 3),
+            dtype=np.uint8,
+        )
+        self._rgb_input = np.empty_like(self._letterbox_canvas)
+        self._input_tensor = np.empty(
+            (1, self._input_size, self._input_size, 3),
+            dtype=np.float32,
+        )
         self._conf_threshold = float(conf_threshold)
         self._nms_threshold = float(nms_threshold)
         self._class_filter = (
@@ -490,10 +500,18 @@ class RknnLiteDetector(BaseDetector):
         )
         self._serialize_inference = bool(serialize_inference)
         self._recognizer = recognizer
+        self._refine_box_from_recognizer = bool(refine_box_from_recognizer)
         self._ocr_cache_seconds = max(0.0, float(ocr_cache_seconds))
         self._ocr_cache_iou = min(1.0, max(0.0, float(ocr_cache_iou)))
         self._ocr_cache: List[
-            Tuple[int, int, Tuple[int, int, int, int], float, Detection]
+            Tuple[
+                int,
+                int,
+                Tuple[int, int, int, int],
+                float,
+                Detection,
+                Tuple[float, float, float, float] | None,
+            ]
         ] = []
         self._rknn = self._RKNNLite()
 
@@ -575,7 +593,8 @@ class RknnLiteDetector(BaseDetector):
         new_height = max(1, int(round(height * scale)))
 
         resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-        canvas = np.full((self._input_size, self._input_size, 3), 114, dtype=np.uint8)
+        canvas = self._letterbox_canvas
+        canvas.fill(114)
         pad_x = (self._input_size - new_width) // 2
         pad_y = (self._input_size - new_height) // 2
         canvas[pad_y:pad_y + new_height, pad_x:pad_x + new_width] = resized
@@ -583,11 +602,10 @@ class RknnLiteDetector(BaseDetector):
 
     def _prepare_input(self, image: np.ndarray) -> Tuple[np.ndarray, float, int, int]:
         letterboxed, scale, pad_x, pad_y = self._letterbox(image)
-        rgb = cv2.cvtColor(letterboxed, cv2.COLOR_BGR2RGB)
-        tensor = rgb.astype(np.float32)
-        tensor /= 255.0
-        tensor = np.expand_dims(tensor, axis=0)
-        return tensor, scale, pad_x, pad_y
+        cv2.cvtColor(letterboxed, cv2.COLOR_BGR2RGB, dst=self._rgb_input)
+        np.copyto(self._input_tensor[0], self._rgb_input, casting="unsafe")
+        self._input_tensor[0] /= 255.0
+        return self._input_tensor, scale, pad_x, pad_y
 
     def _select_prediction_array(self, outputs) -> np.ndarray | None:
         arrays: List[np.ndarray] = []
@@ -704,9 +722,9 @@ class RknnLiteDetector(BaseDetector):
         box: Tuple[int, int, int, int],
         image_width: int,
         image_height: int,
-    ) -> Detection | None:
+    ) -> Tuple[Detection | None, Tuple[int, int, int, int] | None]:
         if self._recognizer is None:
-            return None
+            return None, None
 
         cached = self._find_cached_recognition(
             box,
@@ -724,14 +742,58 @@ class RknnLiteDetector(BaseDetector):
         )
         crop = frame[oy1:oy2, ox1:ox2]
         recognized = self._recognize_crop(crop)
+        refined_box = None
         if recognized is not None:
+            if self._refine_box_from_recognizer:
+                refined_box = self._map_recognized_box(
+                    box,
+                    recognized.box,
+                    crop_origin=(ox1, oy1),
+                    image_width=image_width,
+                    image_height=image_height,
+                )
             self._store_cached_recognition(
                 box,
                 recognized,
+                refined_box=refined_box,
                 image_width=image_width,
                 image_height=image_height,
             )
-        return recognized
+        return recognized, refined_box
+
+    @classmethod
+    def _map_recognized_box(
+        cls,
+        detector_box: Tuple[int, int, int, int],
+        recognized_box: Tuple[int, int, int, int],
+        *,
+        crop_origin: Tuple[int, int],
+        image_width: int,
+        image_height: int,
+    ) -> Tuple[int, int, int, int] | None:
+        rx, ry, rw, rh = recognized_box
+        if rw < 2 or rh < 2:
+            return None
+
+        ox, oy = crop_origin
+        raw_x1 = ox + rx
+        raw_y1 = oy + ry
+        x1 = max(0, min(image_width - 1, raw_x1))
+        y1 = max(0, min(image_height - 1, raw_y1))
+        x2 = max(x1 + 1, min(image_width, raw_x1 + rw))
+        y2 = max(y1 + 1, min(image_height, raw_y1 + rh))
+
+        dx1, dy1, dx2, dy2 = detector_box
+        detector_width = max(1, dx2 - dx1)
+        detector_height = max(1, dy2 - dy1)
+        detector_xyxy = (dx1, dy1, dx2, dy2)
+        refined_xyxy = (x1, y1, x2, y2)
+        area_ratio = ((x2 - x1) * (y2 - y1)) / float(detector_width * detector_height)
+        if not 0.20 <= area_ratio <= 2.50:
+            return None
+        if cls._box_iou_xyxy(detector_xyxy, refined_xyxy) < 0.20:
+            return None
+        return x1, y1, x2 - x1, y2 - y1
 
     @staticmethod
     def _box_iou_xyxy(
@@ -757,7 +819,7 @@ class RknnLiteDetector(BaseDetector):
         *,
         image_width: int,
         image_height: int,
-    ) -> Detection | None:
+    ) -> Tuple[Detection, Tuple[int, int, int, int] | None] | None:
         if self._ocr_cache_seconds <= 0:
             return None
 
@@ -768,15 +830,26 @@ class RknnLiteDetector(BaseDetector):
             if (now - entry[3]) <= self._ocr_cache_seconds
         ]
         best_iou = self._ocr_cache_iou
-        best: Detection | None = None
-        for cached_width, cached_height, cached_box, _, cached_result in self._ocr_cache:
+        best: Tuple[Detection, Tuple[int, int, int, int] | None] | None = None
+        for cached_width, cached_height, cached_box, _, cached_result, box_transform in self._ocr_cache:
             if cached_width != image_width or cached_height != image_height:
                 continue
             overlap = self._box_iou_xyxy(box, cached_box)
             if overlap < best_iou:
                 continue
             best_iou = overlap
-            best = cached_result
+            refined_box = None
+            if box_transform is not None:
+                x1, y1, x2, y2 = box
+                width = max(1, x2 - x1)
+                height = max(1, y2 - y1)
+                rel_x, rel_y, rel_width, rel_height = box_transform
+                refined_x = max(0, min(image_width - 1, int(round(x1 + rel_x * width))))
+                refined_y = max(0, min(image_height - 1, int(round(y1 + rel_y * height))))
+                refined_width = max(1, min(image_width - refined_x, int(round(rel_width * width))))
+                refined_height = max(1, min(image_height - refined_y, int(round(rel_height * height))))
+                refined_box = (refined_x, refined_y, refined_width, refined_height)
+            best = cached_result, refined_box
         return best
 
     def _store_cached_recognition(
@@ -784,6 +857,7 @@ class RknnLiteDetector(BaseDetector):
         box: Tuple[int, int, int, int],
         recognized: Detection,
         *,
+        refined_box: Tuple[int, int, int, int] | None,
         image_width: int,
         image_height: int,
     ) -> None:
@@ -793,7 +867,7 @@ class RknnLiteDetector(BaseDetector):
         now = time.monotonic()
         retained = []
         for entry in self._ocr_cache:
-            cached_width, cached_height, cached_box, cached_time, _ = entry
+            cached_width, cached_height, cached_box, cached_time, _, _ = entry
             if (now - cached_time) > self._ocr_cache_seconds:
                 continue
             if (
@@ -803,7 +877,19 @@ class RknnLiteDetector(BaseDetector):
             ):
                 continue
             retained.append(entry)
-        retained.append((image_width, image_height, box, now, recognized))
+        box_transform = None
+        if refined_box is not None:
+            x1, y1, x2, y2 = box
+            width = max(1, x2 - x1)
+            height = max(1, y2 - y1)
+            refined_x, refined_y, refined_width, refined_height = refined_box
+            box_transform = (
+                (refined_x - x1) / float(width),
+                (refined_y - y1) / float(height),
+                refined_width / float(width),
+                refined_height / float(height),
+            )
+        retained.append((image_width, image_height, box, now, recognized, box_transform))
         self._ocr_cache = retained
 
     @staticmethod
@@ -881,7 +967,7 @@ class RknnLiteDetector(BaseDetector):
 
             class_id = int(filtered_classes[index])
             class_name = self._labels[class_id] if 0 <= class_id < len(self._labels) else f"plate_{class_id}"
-            recognized = self._recognize_box(
+            recognized, refined_box = self._recognize_box(
                 frame,
                 (ix1, iy1, ix2, iy2),
                 image_width,
@@ -905,7 +991,7 @@ class RknnLiteDetector(BaseDetector):
                     type_name=type_name,
                     full_text=full_text,
                     score=float(filtered_scores[index]),
-                    box=(ix1, iy1, max(1, ix2 - ix1), max(1, iy2 - iy1)),
+                    box=refined_box or (ix1, iy1, max(1, ix2 - ix1), max(1, iy2 - iy1)),
                 )
             )
 

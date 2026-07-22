@@ -359,16 +359,18 @@ def save_debug_images(output_dir: Path, frame_index: int, frame: np.ndarray, mas
 
 def compose_display_frame(
     frame: np.ndarray,
-    mask: np.ndarray,
+    mask: np.ndarray | None,
     mode: str,
     alpha: float,
 ) -> np.ndarray:
     if mode == "camera":
         return frame.copy()
-    if mode == "mask":
-        return cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
     if mode == "outline":
         return frame.copy()
+    if mask is None:
+        raise ValueError(f"显示模式 {mode} 需要 FPGA 掩码")
+    if mode == "mask":
+        return cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
     return draw_mask_overlay(frame, mask, alpha)
 
 
@@ -652,20 +654,29 @@ class BoxMotionTracker:
         )
         return resized, scale
 
-    def _advance(self, current_gray: np.ndarray, scale: float) -> List[Detection]:
-        if self._previous_gray is None or not self._detections:
-            return list(self._detections)
+    def _track_between(
+        self,
+        source_gray: np.ndarray,
+        current_gray: np.ndarray,
+        detections: List[Detection],
+        scale: float,
+        *,
+        max_scale_change: float,
+        verify_round_trip: bool,
+    ) -> Tuple[List[Detection], List[bool]]:
+        if not detections or source_gray.shape != current_gray.shape:
+            return list(detections), [False] * len(detections)
 
         all_points = []
         point_owners: List[int] = []
-        height, width = self._previous_gray.shape[:2]
-        for index, det in enumerate(self._detections):
+        height, width = source_gray.shape[:2]
+        for index, det in enumerate(detections):
             x, y, box_width, box_height = det.box
             x1 = max(0, min(width - 1, int(round(x * scale))))
             y1 = max(0, min(height - 1, int(round(y * scale))))
             x2 = max(x1 + 1, min(width, int(round((x + box_width) * scale))))
             y2 = max(y1 + 1, min(height, int(round((y + box_height) * scale))))
-            roi = self._previous_gray[y1:y2, x1:x2]
+            roi = source_gray[y1:y2, x1:x2]
             if roi.size == 0:
                 continue
             points = cv2.goodFeaturesToTrack(
@@ -683,11 +694,11 @@ class BoxMotionTracker:
             point_owners.extend([index] * len(points))
 
         if not all_points:
-            return list(self._detections)
+            return list(detections), [False] * len(detections)
 
         previous_points = np.concatenate(all_points, axis=0).astype(np.float32, copy=False)
         current_points, status, _ = cv2.calcOpticalFlowPyrLK(
-            self._previous_gray,
+            source_gray,
             current_gray,
             previous_points,
             None,
@@ -696,32 +707,102 @@ class BoxMotionTracker:
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03),
         )
         if current_points is None or status is None:
-            return list(self._detections)
+            return list(detections), [False] * len(detections)
 
         moved: List[Detection] = []
+        succeeded: List[bool] = []
         frame_width = max(1, int(round(width / max(scale, 1e-6))))
         frame_height = max(1, int(round(height / max(scale, 1e-6))))
+        previous_flat = previous_points.reshape(-1, 2)
+        current_flat = current_points.reshape(-1, 2)
         status_flat = status.reshape(-1).astype(bool)
-        displacement = current_points.reshape(-1, 2) - previous_points.reshape(-1, 2)
-        for index, det in enumerate(self._detections):
-            owner_mask = np.asarray(point_owners) == index
+        if verify_round_trip:
+            backward_points, backward_status, _ = cv2.calcOpticalFlowPyrLK(
+                current_gray,
+                source_gray,
+                current_points,
+                None,
+                winSize=(15, 15),
+                maxLevel=2,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03),
+            )
+            if backward_points is None or backward_status is None:
+                return list(detections), [False] * len(detections)
+            backward_flat = backward_points.reshape(-1, 2)
+            round_trip_error = np.linalg.norm(backward_flat - previous_flat, axis=1)
+            status_flat &= backward_status.reshape(-1).astype(bool)
+            status_flat &= round_trip_error <= 1.5
+        displacement = current_flat - previous_flat
+        owners = np.asarray(point_owners)
+        for index, det in enumerate(detections):
+            owner_mask = owners == index
             valid = owner_mask & status_flat
             if int(np.count_nonzero(valid)) < 2:
                 moved.append(det)
+                succeeded.append(False)
                 continue
-            dx, dy = np.median(displacement[valid], axis=0) / max(scale, 1e-6)
+
+            local_displacement = displacement[valid]
+            median_displacement = np.median(local_displacement, axis=0)
+            residual = np.linalg.norm(local_displacement - median_displacement, axis=1)
+            median_residual = float(np.median(residual))
+            inliers = residual <= max(1.5, median_residual * 3.0)
+            if int(np.count_nonzero(inliers)) < 2:
+                moved.append(det)
+                succeeded.append(False)
+                continue
+
+            source_inliers = previous_flat[valid][inliers]
+            current_inliers = current_flat[valid][inliers]
+            source_center = np.median(source_inliers, axis=0)
+            current_center = np.median(current_inliers, axis=0)
+            dx, dy = (current_center - source_center) / max(scale, 1e-6)
             if abs(float(dx)) > det.box[2] * 1.5 or abs(float(dy)) > det.box[3] * 2.0:
                 moved.append(det)
+                succeeded.append(False)
                 continue
+
+            box_scale = 1.0
+            if len(source_inliers) >= 4:
+                source_radius = float(np.median(np.linalg.norm(source_inliers - source_center, axis=1)))
+                current_radius = float(np.median(np.linalg.norm(current_inliers - current_center, axis=1)))
+                if source_radius >= 2.0:
+                    raw_scale = current_radius / source_radius
+                    box_scale = float(
+                        np.clip(
+                            raw_scale,
+                            1.0 - max_scale_change,
+                            1.0 + max_scale_change,
+                        )
+                    )
+
             x, y, box_width, box_height = det.box
-            next_x = max(0, min(frame_width - box_width, int(round(x + dx))))
-            next_y = max(0, min(frame_height - box_height, int(round(y + dy))))
+            next_width = max(1, min(frame_width, int(round(box_width * box_scale))))
+            next_height = max(1, min(frame_height, int(round(box_height * box_scale))))
+            center_x = x + box_width * 0.5 + float(dx)
+            center_y = y + box_height * 0.5 + float(dy)
+            next_x = max(0, min(frame_width - next_width, int(round(center_x - next_width * 0.5))))
+            next_y = max(0, min(frame_height - next_height, int(round(center_y - next_height * 0.5))))
             moved.append(
                 self._copy_with_box(
                     det,
-                    (next_x, next_y, box_width, box_height),
+                    (next_x, next_y, next_width, next_height),
                 )
             )
+            succeeded.append(True)
+        return moved, succeeded
+
+    def _advance(self, current_gray: np.ndarray, scale: float) -> List[Detection]:
+        if self._previous_gray is None or not self._detections:
+            return list(self._detections)
+        moved, _ = self._track_between(
+            self._previous_gray,
+            current_gray,
+            self._detections,
+            scale,
+            max_scale_change=0.08,
+            verify_round_trip=False,
+        )
         return moved
 
     def update(
@@ -729,14 +810,33 @@ class BoxMotionTracker:
         gray: np.ndarray,
         detections: List[Detection],
         generation: int,
+        *,
+        detection_gray: np.ndarray | None = None,
     ) -> List[Detection]:
         current_gray, scale = self._resize_gray(gray)
         moved = self._advance(current_gray, scale)
 
         if generation != self._generation:
+            compensated = list(detections)
+            compensated_ok = [False] * len(detections)
+            if detection_gray is not None and detections:
+                source_gray, source_scale = self._resize_gray(detection_gray)
+                if abs(source_scale - scale) <= 1e-6:
+                    compensated, compensated_ok = self._track_between(
+                        source_gray,
+                        current_gray,
+                        detections,
+                        scale,
+                        max_scale_change=0.30,
+                        verify_round_trip=True,
+                    )
+
             reconciled: List[Detection] = []
             used = set()
-            for current in detections:
+            for detection_index, current in enumerate(compensated):
+                if compensated_ok[detection_index]:
+                    reconciled.append(current)
+                    continue
                 match_index = next(
                     (
                         index
@@ -1118,6 +1218,7 @@ def create_detector(args: argparse.Namespace) -> BaseDetector:
             ocr_cache_seconds=args.rknn_ocr_cache_seconds,
             ocr_cache_iou=args.rknn_ocr_cache_iou,
             serialize_inference=(not args.rknn_allow_concurrent_inference),
+            refine_box_from_recognizer=(not args.rknn_disable_ocr_box_refinement),
         )
     return MockDetector()
 
@@ -1340,8 +1441,9 @@ class AsyncDetectorRunner:
         self._detector = detector
         self._args = args
         self._lock = threading.Lock()
-        self._pending: Tuple[np.ndarray, List[Tuple[int, int, int, int]], int] | None = None
+        self._pending: Tuple[np.ndarray, np.ndarray, List[Tuple[int, int, int, int]], int] | None = None
         self._latest: List[Detection] = []
+        self._latest_source_gray: np.ndarray | None = None
         self._latest_mode = "idle"
         self._busy = False
         self._stopped = False
@@ -1355,17 +1457,22 @@ class AsyncDetectorRunner:
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
-    def submit(self, frame: np.ndarray, candidate_boxes_full: List[Tuple[int, int, int, int]]) -> None:
+    def submit(
+        self,
+        frame: np.ndarray,
+        source_gray: np.ndarray,
+        candidate_boxes_full: List[Tuple[int, int, int, int]],
+    ) -> None:
         if self._args.detector == "mock":
             return
 
         with self._lock:
             self._submit_generation += 1
             # 摄像头每次返回独立 ndarray；保留引用即可，避免每次提交复制整张 720p 图像。
-            task = (frame, list(candidate_boxes_full), self._submit_generation)
+            task = (frame, source_gray, list(candidate_boxes_full), self._submit_generation)
             self._pending = task
 
-    def snapshot(self) -> Tuple[List[Detection], str, bool, int, int, float, float]:
+    def snapshot(self) -> Tuple[List[Detection], str, bool, int, int, float, float, np.ndarray | None]:
         with self._lock:
             return (
                 list(self._latest),
@@ -1375,6 +1482,7 @@ class AsyncDetectorRunner:
                 self._completed_generation,
                 self._latest_update_time,
                 self._last_duration_ms,
+                self._latest_source_gray,
             )
 
     def close(self) -> None:
@@ -1397,7 +1505,7 @@ class AsyncDetectorRunner:
                 time.sleep(0.005)
                 continue
 
-            frame, candidate_boxes_full, generation = task
+            frame, source_gray, candidate_boxes_full, generation = task
             started = time.perf_counter()
             self._submit_count += 1
             extra_roi_boxes: List[Tuple[int, int, int, int]] = []
@@ -1430,6 +1538,7 @@ class AsyncDetectorRunner:
                         self._latest = fast_detections
                         self._latest_mode = "quick"
                         self._latest_update_time = time.monotonic()
+                        self._latest_source_gray = source_gray
                         self._miss_count = 0
                         self._last_success_time = time.monotonic()
 
@@ -1462,6 +1571,7 @@ class AsyncDetectorRunner:
                     )
                     self._latest_mode = detector_mode
                     self._latest_update_time = time.monotonic()
+                    self._latest_source_gray = source_gray
                     self._miss_count = 0
                     self._last_success_time = time.monotonic()
                 elif self._latest and (
@@ -1471,6 +1581,7 @@ class AsyncDetectorRunner:
                     self._latest_mode = f"{detector_mode}_hold"
                 else:
                     self._latest = []
+                    self._latest_source_gray = None
                     self._latest_mode = detector_mode
                     self._latest_update_time = 0.0
                     self._miss_count = 0
@@ -1607,6 +1718,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--box-display-mode", choices=("hold", "flash"), default="hold", help="车牌框显示模式：hold=持续显示最近结果，flash=仅在新结果返回时闪一下")
     parser.add_argument("--box-hold-seconds", type=float, default=0.40, help="hold 模式下车牌框最多保留最近结果多少秒，越小跟随越灵敏")
     parser.add_argument("--disable-box-tracking", action="store_true", help="关闭检测间隔内的轻量光流跟随，仅显示原始检测框")
+    parser.add_argument("--disable-detection-lag-compensation", action="store_true", help="关闭异步检测源帧到当前帧的位置补偿，仅用于 A/B 对比")
     parser.add_argument("--detector", choices=("mock", "hyperlpr", "rknn"), default="mock", help="候选区域二阶段检测器")
     parser.add_argument("--detector-source", choices=("full", "roi", "hybrid"), default="full", help="检测器输入来源：full=全帧，roi=只跑 FPGA ROI，hybrid=先全帧后 ROI")
     parser.add_argument("--detector-interval", type=parse_int_auto, default=3, help="每隔多少帧真正跑一次检测，其他帧复用上次结果")
@@ -1638,6 +1750,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rknn-allow-concurrent-inference", action="store_true", help="允许两个 RKNN 模型并发调用 NPU；默认串行调度以避免 RK3568 单核 NPU 争抢")
     parser.add_argument("--rknn-labels", default="单层车牌,双层车牌", help="RKNN 类别名称，逗号分隔")
     parser.add_argument("--rknn-disable-hyperlpr-ocr", action="store_true", help="仅用 RKNN 做车牌框检测，不复用 HyperLPR 做文字识别")
+    parser.add_argument("--rknn-disable-ocr-box-refinement", action="store_true", help="保留 OCR 文字但关闭 HyperLPR 内框校准，仅用于 A/B 对比")
     parser.add_argument("--rknn-ocr-cache-seconds", type=float, default=2.0, help="同一车牌成功 OCR 结果的复用时长，降低重复 CPU 推理")
     parser.add_argument("--rknn-ocr-cache-iou", type=float, default=0.50, help="复用 OCR 结果所需的最低框 IoU")
     parser.add_argument("--person-model", default="", help="独立行人 RKNN 模型路径；留空时完全关闭行人检测，不影响现有流程")
@@ -1956,7 +2069,11 @@ def main() -> None:
             sx = frame.shape[1] / max(mask_small.shape[1], 1)
             sy = frame.shape[0] / max(mask_small.shape[0], 1)
             candidate_boxes_full = [scale_box(box, sx, sy) for box in candidate_boxes_small]
-            mask_full = cv2.resize(mask_small, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+            mask_full = (
+                cv2.resize(mask_small, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+                if args.display_mode in ("overlay", "mask")
+                else None
+            )
 
             display = compose_display_frame(
                 frame,
@@ -1998,7 +2115,7 @@ def main() -> None:
                 and (now_submit - last_detector_submit_time) >= args.detector_submit_max_gap_seconds
             )
             if detector_runner is not None and (submit_due_by_frame or submit_due_by_time):
-                detector_runner.submit(frame, candidate_boxes_full)
+                detector_runner.submit(frame, gray, candidate_boxes_full)
                 last_detector_submit_time = now_submit
 
             if detector_runner is not None:
@@ -2010,6 +2127,7 @@ def main() -> None:
                     detector_completed_generation,
                     detector_latest_update_time,
                     detector_duration_ms,
+                    detector_source_gray,
                 ) = detector_runner.snapshot()
             else:
                 detector_busy = False
@@ -2017,9 +2135,19 @@ def main() -> None:
                 detector_completed_generation = 0
                 detector_latest_update_time = 0.0
                 detector_duration_ms = 0.0
+                detector_source_gray = None
 
             tracked_detections = (
-                box_tracker.update(gray, cached_detections, detector_completed_generation)
+                box_tracker.update(
+                    gray,
+                    cached_detections,
+                    detector_completed_generation,
+                    detection_gray=(
+                        None
+                        if args.disable_detection_lag_compensation
+                        else detector_source_gray
+                    ),
+                )
                 if box_tracker is not None
                 else list(cached_detections)
             )
@@ -2128,7 +2256,14 @@ def main() -> None:
             draw_unicode_texts(display, unicode_items, unicode_font)
 
             if output_dir is not None and args.save_every > 0 and (total_frames == 1 or total_frames % args.save_every == 0):
-                save_debug_images(output_dir, total_frames, frame, mask_full, display)
+                debug_mask = mask_full
+                if debug_mask is None:
+                    debug_mask = cv2.resize(
+                        mask_small,
+                        (frame.shape[1], frame.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                save_debug_images(output_dir, total_frames, frame, debug_mask, display)
                 print(f"saved debug images at frame {total_frames} -> {output_dir}", flush=True)
 
             if args.log_every > 0 and (total_frames == 1 or total_frames % args.log_every == 0):

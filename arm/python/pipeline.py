@@ -31,6 +31,7 @@ from fpga_client import (
     FpgaPreprocessClient,
     PREPROC_SOBEL,
 )
+from evaluation_metrics import MetricsRecorder
 
 
 _UNICODE_TEXT_CACHE: Dict[Tuple[int, str, Tuple[int, int, int], Tuple[int, int, int], int], Tuple[np.ndarray, int, int]] = {}
@@ -992,6 +993,10 @@ class StaticImageSource:
         self._frame = cv2.imread(str(self.path), cv2.IMREAD_COLOR)
         if self._frame is None:
             raise RuntimeError(f"输入图片无法解码或格式不受支持: {self.path}")
+        self.source_kind = "image"
+        self.current_frame_index = 1
+        self.current_timestamp_seconds = 0.0
+        self.current_source_name = self.path.name
 
     def isOpened(self) -> bool:
         return self._frame is not None
@@ -1003,6 +1008,110 @@ class StaticImageSource:
 
     def release(self) -> None:
         pass
+
+    def get(self, property_id: int) -> float:
+        if property_id == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self._frame.shape[1])
+        if property_id == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self._frame.shape[0])
+        if property_id == cv2.CAP_PROP_FRAME_COUNT:
+            return 1.0
+        return 0.0
+
+
+class VideoFileSource:
+    """从 SD 卡或本地文件读取视频，支持实时节奏、极速测试和循环播放。"""
+
+    def __init__(self, video_path: str, *, loop: bool, playback: str) -> None:
+        expanded_path = os.path.expandvars(os.path.expanduser(video_path))
+        self.path = Path(expanded_path).resolve()
+        if not self.path.is_file():
+            raise FileNotFoundError(f"输入视频不存在: {self.path}")
+
+        self._cap = cv2.VideoCapture(str(self.path))
+        if not self._cap.isOpened():
+            raise RuntimeError(f"输入视频无法解码或格式不受支持: {self.path}")
+        self._loop = bool(loop)
+        self._playback = playback
+        self._fps = float(self._cap.get(cv2.CAP_PROP_FPS))
+        self._frame_count = int(round(self._cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+        self._clip_frame_index = 0
+        self._global_frame_index = 0
+        self._loop_index = 0
+        self._playback_started = 0.0
+        self.ended = False
+        self.source_kind = "video"
+        self.current_frame_index = 0
+        self.current_timestamp_seconds = 0.0
+        self.current_source_name = self.path.name
+
+    def isOpened(self) -> bool:
+        return self._cap.isOpened()
+
+    def get(self, property_id: int) -> float:
+        if property_id == cv2.CAP_PROP_FPS:
+            return self._fps
+        if property_id == cv2.CAP_PROP_FRAME_COUNT:
+            return float(self._frame_count)
+        return float(self._cap.get(property_id))
+
+    def read(self) -> Tuple[bool, np.ndarray | None]:
+        ok, frame = self._cap.read()
+        if not ok or frame is None:
+            if not self._loop:
+                self.ended = True
+                return False, None
+            self._loop_index += 1
+            self._clip_frame_index = 0
+            self._playback_started = 0.0
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = self._cap.read()
+            if not ok or frame is None:
+                self.ended = True
+                return False, None
+
+        self._clip_frame_index += 1
+        self._global_frame_index += 1
+        self.current_frame_index = self._clip_frame_index
+        source_time = float(self._cap.get(cv2.CAP_PROP_POS_MSEC)) / 1000.0
+        if source_time <= 0.0 and self._fps > 0:
+            source_time = (self._clip_frame_index - 1) / self._fps
+        self.current_timestamp_seconds = max(source_time, 0.0)
+
+        if self._playback == "realtime" and self._fps > 0:
+            now = time.monotonic()
+            if self._playback_started <= 0.0:
+                self._playback_started = now - self.current_timestamp_seconds
+            target_time = self._playback_started + self.current_timestamp_seconds
+            if target_time > now:
+                time.sleep(target_time - now)
+        return True, frame
+
+    def release(self) -> None:
+        self._cap.release()
+
+
+def get_source_frame_info(source, fallback_frame: int) -> Tuple[int, float, str]:
+    return (
+        int(getattr(source, "current_frame_index", fallback_frame)),
+        float(getattr(source, "current_timestamp_seconds", 0.0)),
+        str(getattr(source, "current_source_name", "")),
+    )
+
+
+def describe_frame_source(source, args: argparse.Namespace) -> Dict[str, object]:
+    kind = str(getattr(source, "source_kind", "camera"))
+    path = args.input_image or args.input_video
+    return {
+        "kind": kind,
+        "path": str(Path(path).expanduser()) if path else "",
+        "width": int(round(source.get(cv2.CAP_PROP_FRAME_WIDTH))),
+        "height": int(round(source.get(cv2.CAP_PROP_FRAME_HEIGHT))),
+        "fps": float(source.get(cv2.CAP_PROP_FPS)),
+        "frame_count": int(round(source.get(cv2.CAP_PROP_FRAME_COUNT))),
+        "video_playback": args.video_playback if args.input_video else "",
+        "video_loop": bool(args.video_loop) if args.input_video else False,
+    }
 
 
 def open_camera(
@@ -1023,6 +1132,12 @@ def open_camera(
 def open_frame_source(args: argparse.Namespace):
     if args.input_image:
         return StaticImageSource(args.input_image)
+    if args.input_video:
+        return VideoFileSource(
+            args.input_video,
+            loop=args.video_loop,
+            playback=args.video_playback,
+        )
     return open_camera(
         args.camera,
         args.camera_width,
@@ -1449,7 +1564,15 @@ class AsyncDetectorRunner:
         self._detector = detector
         self._args = args
         self._lock = threading.Lock()
-        self._pending: Tuple[np.ndarray, np.ndarray, List[Tuple[int, int, int, int]], int] | None = None
+        self._pending: Tuple[
+            np.ndarray,
+            np.ndarray,
+            List[Tuple[int, int, int, int]],
+            int,
+            int,
+            float,
+            str,
+        ] | None = None
         self._latest: List[Detection] = []
         self._latest_source_gray: np.ndarray | None = None
         self._latest_mode = "idle"
@@ -1460,6 +1583,11 @@ class AsyncDetectorRunner:
         self._completed_generation = 0
         self._latest_update_time = 0.0
         self._last_duration_ms = 0.0
+        self._completed_result: List[Detection] = []
+        self._completed_source_frame = 0
+        self._completed_source_time = 0.0
+        self._completed_source_name = ""
+        self._completed_mode = "idle"
         self._miss_count = 0
         self._last_success_time = 0.0
         self._thread = threading.Thread(target=self._worker, daemon=True)
@@ -1470,6 +1598,9 @@ class AsyncDetectorRunner:
         frame: np.ndarray,
         source_gray: np.ndarray,
         candidate_boxes_full: List[Tuple[int, int, int, int]],
+        source_frame: int = 0,
+        source_time_s: float = 0.0,
+        source_name: str = "",
     ) -> None:
         if self._args.detector == "mock":
             return
@@ -1477,7 +1608,15 @@ class AsyncDetectorRunner:
         with self._lock:
             self._submit_generation += 1
             # 摄像头每次返回独立 ndarray；保留引用即可，避免每次提交复制整张 720p 图像。
-            task = (frame, source_gray, list(candidate_boxes_full), self._submit_generation)
+            task = (
+                frame,
+                source_gray,
+                list(candidate_boxes_full),
+                self._submit_generation,
+                source_frame,
+                source_time_s,
+                source_name,
+            )
             self._pending = task
 
     def snapshot(self) -> Tuple[List[Detection], str, bool, int, int, float, float, np.ndarray | None]:
@@ -1491,6 +1630,18 @@ class AsyncDetectorRunner:
                 self._latest_update_time,
                 self._last_duration_ms,
                 self._latest_source_gray,
+            )
+
+    def metrics_snapshot(self) -> Tuple[List[Detection], int, int, float, str, float, str]:
+        with self._lock:
+            return (
+                list(self._completed_result),
+                self._completed_generation,
+                self._completed_source_frame,
+                self._completed_source_time,
+                self._completed_source_name,
+                self._last_duration_ms,
+                self._completed_mode,
             )
 
     def close(self) -> None:
@@ -1513,7 +1664,15 @@ class AsyncDetectorRunner:
                 time.sleep(0.005)
                 continue
 
-            frame, source_gray, candidate_boxes_full, generation = task
+            (
+                frame,
+                source_gray,
+                candidate_boxes_full,
+                generation,
+                source_frame,
+                source_time_s,
+                source_name,
+            ) = task
             started = time.perf_counter()
             self._submit_count += 1
             extra_roi_boxes: List[Tuple[int, int, int, int]] = []
@@ -1571,6 +1730,7 @@ class AsyncDetectorRunner:
 
             with self._lock:
                 self._completed_generation = generation
+                metric_detections: List[Detection] = []
                 if detections:
                     self._latest = stabilize_detections_with_history(
                         latest_snapshot,
@@ -1582,6 +1742,7 @@ class AsyncDetectorRunner:
                     self._latest_source_gray = source_gray
                     self._miss_count = 0
                     self._last_success_time = time.monotonic()
+                    metric_detections = list(self._latest)
                 elif self._latest and (
                     (time.monotonic() - self._last_success_time) < self._args.detector_hold_seconds
                 ) and self._miss_count < self._args.detector_hold_frames:
@@ -1593,6 +1754,11 @@ class AsyncDetectorRunner:
                     self._latest_mode = detector_mode
                     self._latest_update_time = 0.0
                     self._miss_count = 0
+                self._completed_result = metric_detections
+                self._completed_source_frame = source_frame
+                self._completed_source_time = source_time_s
+                self._completed_source_name = source_name
+                self._completed_mode = detector_mode
                 self._last_duration_ms = (time.perf_counter() - started) * 1000.0
                 self._busy = False
 
@@ -1675,6 +1841,20 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="从 SD 卡或本地文件系统读取单张图片；留空时继续使用摄像头",
     )
+    parser.add_argument(
+        "--input-video",
+        "--sd-video",
+        dest="input_video",
+        default="",
+        help="从 SD 卡或本地文件系统读取视频；与 --input-image 互斥",
+    )
+    parser.add_argument("--video-loop", action="store_true", help="输入视频播放结束后从头循环")
+    parser.add_argument(
+        "--video-playback",
+        choices=("realtime", "fast"),
+        default="realtime",
+        help="视频播放节奏：realtime=不快于源帧率，fast=不等待并用于吞吐率测试",
+    )
     parser.add_argument("--camera", type=parse_int_auto, default=0, help="摄像头编号")
     parser.add_argument("--camera-width", type=parse_int_auto, default=1280, help="摄像头采集宽度")
     parser.add_argument("--camera-height", type=parse_int_auto, default=720, help="摄像头采集高度")
@@ -1708,6 +1888,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-dir", default="", help="调试图输出目录")
     parser.add_argument("--save-every", type=parse_int_auto, default=30, help="每隔多少帧保存一组图像")
     parser.add_argument("--log-every", type=parse_int_auto, default=10, help="每隔多少帧打印一次进度")
+    parser.add_argument(
+        "--metrics-dir",
+        "--test-output",
+        dest="metrics_dir",
+        default="",
+        help="自动测试结果目录；启用后输出 frames.csv、detections.csv 和 summary.json",
+    )
+    parser.add_argument(
+        "--metrics-ground-truth",
+        default="",
+        help="可选标注JSON；提供后统计IoU、Precision、Recall、F1、OCR及类型准确率",
+    )
+    parser.add_argument("--metrics-iou-threshold", type=float, default=0.50, help="预测框与标注框匹配的IoU阈值")
+    parser.add_argument("--metrics-warmup-frames", type=parse_int_auto, default=0, help="统计时忽略前多少帧的性能采样")
     parser.add_argument(
         "--display-mode",
         choices=("outline", "overlay", "camera", "mask"),
@@ -1796,6 +1990,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if args.input_image and args.input_video:
+        raise ValueError("--input-image/--sd-image 与 --input-video/--sd-video 不能同时使用")
+    if args.metrics_ground_truth and not args.metrics_dir:
+        raise ValueError("使用 --metrics-ground-truth 时必须同时指定 --metrics-dir")
+    if not 0.0 <= args.metrics_iou_threshold <= 1.0:
+        raise ValueError("metrics-iou-threshold 必须在 0 到 1 之间")
+    if args.metrics_warmup_frames < 0:
+        raise ValueError("metrics-warmup-frames 不能小于 0")
     if not 0.0 <= args.overlay_alpha <= 1.0:
         raise ValueError("overlay-alpha 必须在 0 到 1 之间")
     if args.mask_kernel < 1:
@@ -1941,6 +2143,17 @@ def main() -> None:
     fpga_runner = AsyncFpgaRunner(fpga, args, startup_status)
     if args.input_image:
         print(f"Input image ready: {Path(args.input_image).expanduser()}", flush=True)
+    elif args.input_video:
+        print(
+            "Input video ready:",
+            f"path={Path(args.input_video).expanduser()}",
+            f"mode={int(round(cap.get(cv2.CAP_PROP_FRAME_WIDTH)))}x{int(round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))}",
+            f"fps={cap.get(cv2.CAP_PROP_FPS):.3f}",
+            f"frames={int(round(cap.get(cv2.CAP_PROP_FRAME_COUNT)))}",
+            f"playback={args.video_playback}",
+            f"loop={int(args.video_loop)}",
+            flush=True,
+        )
     else:
         actual_width = int(round(cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
         actual_height = int(round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
@@ -2033,6 +2246,24 @@ def main() -> None:
     person_completed_generation = 0
     person_latest_update_time = 0.0
     person_duration_ms = 0.0
+    source_description = describe_frame_source(cap, args)
+    metrics_recorder = (
+        MetricsRecorder(
+            args.metrics_dir,
+            source=source_description,
+            arguments=vars(args),
+            ground_truth_path=args.metrics_ground_truth,
+            iou_threshold=args.metrics_iou_threshold,
+            warmup_frames=args.metrics_warmup_frames,
+        )
+        if args.metrics_dir
+        else None
+    )
+    if metrics_recorder is not None:
+        print(f"Metrics enabled: output={metrics_recorder.output_dir}", flush=True)
+    last_metrics_detector_generation = 0
+    last_metrics_fpga_generation = 0
+    last_metrics_person_generation = 0
 
     try:
         while True:
@@ -2040,6 +2271,9 @@ def main() -> None:
             if not ok or frame is None:
                 if args.input_image:
                     raise RuntimeError(f"读取输入图片失败: {args.input_image}")
+                if args.input_video and getattr(cap, "ended", False):
+                    print(f"Input video finished: {args.input_video}", flush=True)
+                    break
                 camera_failures += 1
                 print(
                     f"摄像头读帧失败，开始重试 {camera_failures}/{args.camera_read_retries} ...",
@@ -2057,6 +2291,10 @@ def main() -> None:
             if camera_failures:
                 print(f"摄像头流已恢复，之前连续失败 {camera_failures} 次。", flush=True)
                 camera_failures = 0
+
+            source_frame_index, source_time_s, source_name = get_source_frame_info(
+                cap, total_frames + 1
+            )
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             if person_runner is not None and (
@@ -2092,7 +2330,7 @@ def main() -> None:
                 current_threshold,
                 fpga_busy,
                 _,
-                _,
+                fpga_completed_generation,
                 fpga_duration_ms,
             ) = fpga_runner.snapshot()
             last_threshold = current_threshold
@@ -2148,7 +2386,14 @@ def main() -> None:
                 and (now_submit - last_detector_submit_time) >= args.detector_submit_max_gap_seconds
             )
             if detector_runner is not None and (submit_due_by_frame or submit_due_by_time):
-                detector_runner.submit(frame, gray, candidate_boxes_full)
+                detector_runner.submit(
+                    frame,
+                    gray,
+                    candidate_boxes_full,
+                    source_frame=source_frame_index,
+                    source_time_s=source_time_s,
+                    source_name=source_name,
+                )
                 last_detector_submit_time = now_submit
 
             if detector_runner is not None:
@@ -2162,6 +2407,15 @@ def main() -> None:
                     detector_duration_ms,
                     detector_source_gray,
                 ) = detector_runner.snapshot()
+                (
+                    metric_detector_result,
+                    metric_detector_generation,
+                    metric_detector_source_frame,
+                    metric_detector_source_time,
+                    metric_detector_source_name,
+                    metric_detector_duration_ms,
+                    _,
+                ) = detector_runner.metrics_snapshot()
             else:
                 detector_busy = False
                 detector_submit_generation = 0
@@ -2169,6 +2423,12 @@ def main() -> None:
                 detector_latest_update_time = 0.0
                 detector_duration_ms = 0.0
                 detector_source_gray = None
+                metric_detector_result = []
+                metric_detector_generation = 0
+                metric_detector_source_frame = 0
+                metric_detector_source_time = 0.0
+                metric_detector_source_name = ""
+                metric_detector_duration_ms = 0.0
 
             tracked_detections = (
                 box_tracker.update(
@@ -2245,6 +2505,56 @@ def main() -> None:
                 fps_value = fps_counter / max(now - fps_time, 1e-6)
                 fps_time = now
                 fps_counter = 0
+
+            detector_updated = (
+                metric_detector_generation > 0
+                and metric_detector_generation != last_metrics_detector_generation
+            )
+            fpga_updated = (
+                fpga_completed_generation > 0
+                and fpga_completed_generation != last_metrics_fpga_generation
+            )
+            person_updated = (
+                person_completed_generation > 0
+                and person_completed_generation != last_metrics_person_generation
+            )
+            if metrics_recorder is not None:
+                metrics_recorder.record_frame(
+                    processed_frame=total_frames,
+                    source_frame=source_frame_index,
+                    source_time_s=source_time_s,
+                    source_name=source_name,
+                    real_fps=fps_value,
+                    threshold=last_threshold,
+                    candidate_boxes=last_box_count,
+                    plates=display_detections,
+                    people=display_people,
+                    detector_mode=status_detector_mode,
+                    detector_busy=detector_busy,
+                    fpga_busy=fpga_busy,
+                    fpga_ms=fpga_duration_ms,
+                    detector_ms=(
+                        metric_detector_duration_ms
+                        if detector_updated
+                        else detector_duration_ms
+                    ),
+                    person_ms=person_duration_ms,
+                    detector_generation=metric_detector_generation,
+                    detector_updated=detector_updated,
+                    detector_result=metric_detector_result,
+                    detector_source_frame=metric_detector_source_frame,
+                    detector_source_time_s=metric_detector_source_time,
+                    detector_source_name=metric_detector_source_name,
+                    fpga_updated=fpga_updated,
+                    person_updated=person_updated,
+                    active_pixels=status.active_pixels,
+                )
+            if detector_updated:
+                last_metrics_detector_generation = metric_detector_generation
+            if fpga_updated:
+                last_metrics_fpga_generation = fpga_completed_generation
+            if person_updated:
+                last_metrics_person_generation = person_completed_generation
 
             display_fps_value = fps_value * 2.0
             person_status_text = (
@@ -2329,6 +2639,12 @@ def main() -> None:
             if args.max_frames > 0 and total_frames >= args.max_frames:
                 break
     finally:
+        metrics_summary = None
+        if metrics_recorder is not None:
+            try:
+                metrics_summary = metrics_recorder.close()
+            except Exception as exc:
+                print(f"写入自动测试指标失败: {exc}", flush=True)
         cap.release()
         fpga_runner.close()
         if detector_runner is not None:
@@ -2358,6 +2674,19 @@ def main() -> None:
             f"last_counter={last_status.frame_counter}",
             flush=True,
         )
+        if metrics_summary is not None:
+            runtime_summary = metrics_summary.get("runtime", {})
+            reported_throughput = runtime_summary.get(
+                "measured_throughput_fps",
+                runtime_summary.get("throughput_fps", 0.0),
+            )
+            print(
+                "metrics finished:",
+                f"output={metrics_recorder.output_dir}",
+                f"frames={runtime_summary.get('processed_frames', 0)}",
+                f"throughput_fps={reported_throughput:.3f}",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

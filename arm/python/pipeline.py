@@ -541,6 +541,57 @@ def box_iou(box_a: Tuple[int, int, int, int], box_b: Tuple[int, int, int, int]) 
     return inter_area / float(area_a + area_b - inter_area)
 
 
+def box_intersection_over_smaller(
+    box_a: Tuple[int, int, int, int],
+    box_b: Tuple[int, int, int, int],
+) -> float:
+    ax1, ay1, aw, ah = box_a
+    bx1, by1, bw, bh = box_b
+    ax2, ay2 = ax1 + aw, ay1 + ah
+    bx2, by2 = bx1 + bw, by1 + bh
+    inter_w = max(0, min(ax2, bx2) - max(ax1, bx1))
+    inter_h = max(0, min(ay2, by2) - max(ay1, by1))
+    intersection = inter_w * inter_h
+    smaller_area = max(1, min(aw * ah, bw * bh))
+    return intersection / float(smaller_area)
+
+
+def _plate_detection_quality(detection: Detection) -> Tuple[int, int, float, int]:
+    text = "".join(char for char in (detection.raw_label or "") if char.isalnum())
+    text_length = len(text)
+    if text_length in (7, 8):
+        completeness = 3
+    elif text_length >= 6:
+        completeness = 2
+    elif text_length > 0:
+        completeness = 1
+    else:
+        completeness = 0
+    _, _, width, height = detection.box
+    return completeness, text_length, float(detection.score), max(1, width * height)
+
+
+def deduplicate_static_plate_detections(
+    detections: List[Detection],
+    *,
+    iou_threshold: float = 0.35,
+    containment_threshold: float = 0.65,
+) -> List[Detection]:
+    """合并静态图多尺度切片产生的同牌框，优先保留OCR更完整的结果。"""
+    ordered = sorted(detections, key=_plate_detection_quality, reverse=True)
+    kept: List[Detection] = []
+    for candidate in ordered:
+        duplicated = any(
+            box_iou(candidate.box, existing.box) >= iou_threshold
+            or box_intersection_over_smaller(candidate.box, existing.box)
+            >= containment_threshold
+            for existing in kept
+        )
+        if not duplicated:
+            kept.append(candidate)
+    return kept
+
+
 def merge_detections(
     base: List[Detection],
     extra: List[Detection],
@@ -1597,14 +1648,19 @@ def run_detector_once(
             detector_mode = "hybrid"
 
     if full_detections and roi_detections:
-        return merge_detections(
+        detections = merge_detections(
             full_detections,
             roi_detections,
             iou_threshold=args.detector_merge_iou,
-        ), detector_mode
-    if full_detections:
-        return full_detections, detector_mode
-    return roi_detections, detector_mode
+        )
+    elif full_detections:
+        detections = full_detections
+    else:
+        detections = roi_detections
+
+    if accuracy_priority and getattr(args, "input_image", ""):
+        detections = deduplicate_static_plate_detections(detections)
+    return detections, detector_mode
 
 
 class AsyncDetectorRunner:

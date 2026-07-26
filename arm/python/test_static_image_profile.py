@@ -1,7 +1,12 @@
 import argparse
 import unittest
 
-from pipeline import build_static_image_tiles, configure_static_image_profile
+from detector import Detection
+from pipeline import (
+    build_static_image_tiles,
+    configure_static_image_profile,
+    deduplicate_static_plate_detections,
+)
 
 
 def make_args(**overrides):
@@ -58,6 +63,57 @@ class StaticImageProfileTest(unittest.TestCase):
         self.assertIn((1600, 1200, 2400, 1800), tiles)
         self.assertIn((0, 0, 1600, 1200), tiles)
         self.assertIn((2400, 1800, 1600, 1200), tiles)
+
+    def test_static_duplicate_prefers_complete_plate_text(self):
+        detections = [
+            Detection(
+                label="沪AF710",
+                raw_label="沪AF710",
+                type_name="白色警用",
+                full_text="白色警用, 沪AF710",
+                score=0.92,
+                box=(920, 820, 280, 120),
+            ),
+            Detection(
+                label="沪AF71017",
+                raw_label="沪AF71017",
+                type_name="新能源车牌",
+                full_text="新能源车牌, 沪AF71017",
+                score=0.78,
+                box=(900, 800, 430, 160),
+            ),
+            Detection(
+                label="单层车牌",
+                score=0.95,
+                box=(1180, 805, 155, 155),
+            ),
+        ]
+
+        result = deduplicate_static_plate_detections(detections)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].raw_label, "沪AF71017")
+        self.assertEqual(result[0].box, (900, 800, 430, 160))
+
+    def test_static_dedup_keeps_adjacent_real_plates(self):
+        detections = [
+            Detection(
+                label="苏ED51712",
+                raw_label="苏ED51712",
+                score=0.80,
+                box=(100, 200, 220, 70),
+            ),
+            Detection(
+                label="粤SP8888",
+                raw_label="粤SP8888",
+                score=0.82,
+                box=(340, 200, 220, 70),
+            ),
+        ]
+
+        result = deduplicate_static_plate_detections(detections)
+
+        self.assertEqual(len(result), 2)
 
 
 if __name__ == "__main__":

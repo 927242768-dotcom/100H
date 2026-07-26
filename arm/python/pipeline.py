@@ -478,6 +478,33 @@ def build_detection_tiles(
     return tiles
 
 
+def build_static_image_tiles(
+    image_width: int,
+    image_height: int,
+    overlap_ratio: float = 0.20,
+) -> List[Tuple[int, int, int, int]]:
+    """为高分辨率静态图生成粗、细两级覆盖切片，提升小车牌输入像素数。"""
+    if image_width <= 1 or image_height <= 1:
+        return []
+
+    tiles: List[Tuple[int, int, int, int]] = []
+    for grid_size in (2, 3):
+        cell_w = image_width / grid_size
+        cell_h = image_height / grid_size
+        tile_w = min(image_width, max(1, int(round(cell_w * (1.0 + overlap_ratio)))))
+        tile_h = min(image_height, max(1, int(round(cell_h * (1.0 + overlap_ratio)))))
+        max_x = max(0, image_width - tile_w)
+        max_y = max(0, image_height - tile_h)
+        xs = np.linspace(0, max_x, num=grid_size).round().astype(np.int32)
+        ys = np.linspace(0, max_y, num=grid_size).round().astype(np.int32)
+        for y in ys:
+            for x in xs:
+                tile = (int(x), int(y), tile_w, tile_h)
+                if tile not in tiles:
+                    tiles.append(tile)
+    return tiles
+
+
 def scale_detection(det: Detection, sx: float, sy: float) -> Detection:
     x, y, w, h = det.box
     return Detection(
@@ -985,7 +1012,7 @@ class LatestFrameCamera:
 class StaticImageSource:
     """将单张图片作为持续帧源，便于直接读取 SD 卡测试图片。"""
 
-    def __init__(self, image_path: str) -> None:
+    def __init__(self, image_path: str, *, refresh_fps: float = 10.0) -> None:
         expanded_path = os.path.expandvars(os.path.expanduser(image_path))
         self.path = Path(expanded_path).resolve()
         if not self.path.is_file():
@@ -998,6 +1025,9 @@ class StaticImageSource:
         self.current_frame_index = 1
         self.current_timestamp_seconds = 0.0
         self.current_source_name = self.path.name
+        self._refresh_fps = max(1.0, float(refresh_fps))
+        self._frame_interval = 1.0 / self._refresh_fps
+        self._next_frame_time = 0.0
 
     def isOpened(self) -> bool:
         return self._frame is not None
@@ -1005,6 +1035,10 @@ class StaticImageSource:
     def read(self) -> Tuple[bool, np.ndarray | None]:
         if self._frame is None:
             return False, None
+        now = time.monotonic()
+        if self._next_frame_time > now:
+            time.sleep(self._next_frame_time - now)
+        self._next_frame_time = max(self._next_frame_time + self._frame_interval, time.monotonic())
         return True, self._frame.copy()
 
     def release(self) -> None:
@@ -1015,6 +1049,8 @@ class StaticImageSource:
             return float(self._frame.shape[1])
         if property_id == cv2.CAP_PROP_FRAME_HEIGHT:
             return float(self._frame.shape[0])
+        if property_id == cv2.CAP_PROP_FPS:
+            return self._refresh_fps
         if property_id == cv2.CAP_PROP_FRAME_COUNT:
             return 1.0
         return 0.0
@@ -1132,7 +1168,10 @@ def open_camera(
 
 def open_frame_source(args: argparse.Namespace):
     if args.input_image:
-        return StaticImageSource(args.input_image)
+        return StaticImageSource(
+            args.input_image,
+            refresh_fps=args.image_refresh_fps,
+        )
     if args.input_video:
         return VideoFileSource(
             args.input_video,
@@ -1423,6 +1462,9 @@ def run_detector_once(
         tracked_count = len(extra_roi_boxes) if extra_roi_boxes else 0
         candidate_count = len(candidate_boxes_full)
         target_count = max(1, min(args.detector_max_rois, args.hyperlpr_max_num))
+        accuracy_target_count = target_count
+        if accuracy_priority and getattr(args, "input_image", ""):
+            accuracy_target_count = max(1, min(target_count, max(4, candidate_count)))
         search_mode = (
             accuracy_priority
             or not bool(extra_roi_boxes)
@@ -1435,8 +1477,13 @@ def run_detector_once(
 
         full_detections = detect_on_full_image(frame, full_frame_width)
         if accuracy_priority:
+            detection_tiles = (
+                build_static_image_tiles(frame.shape[1], frame.shape[0])
+                if getattr(args, "input_image", "")
+                else build_detection_tiles(frame.shape[1], frame.shape[0], overlap_ratio=0.25)
+            )
             tile_detections: List[Detection] = []
-            for tile_x, tile_y, tile_w, tile_h in build_detection_tiles(frame.shape[1], frame.shape[0], overlap_ratio=0.25):
+            for tile_x, tile_y, tile_w, tile_h in detection_tiles:
                 tile = frame[tile_y:tile_y + tile_h, tile_x:tile_x + tile_w]
                 if tile.size == 0:
                     continue
@@ -1454,10 +1501,10 @@ def run_detector_once(
                     iou_threshold=args.detector_merge_iou,
                 )
 
-            if len(full_detections) < target_count:
+            if len(full_detections) < accuracy_target_count:
                 enhanced_tile_detections: List[Detection] = []
                 enhanced_frame_for_tiles = enhance_plate_frame(frame)
-                for tile_x, tile_y, tile_w, tile_h in build_detection_tiles(frame.shape[1], frame.shape[0], overlap_ratio=0.25):
+                for tile_x, tile_y, tile_w, tile_h in detection_tiles:
                     tile = enhanced_frame_for_tiles[tile_y:tile_y + tile_h, tile_x:tile_x + tile_w]
                     if tile.size == 0:
                         continue
@@ -1475,7 +1522,7 @@ def run_detector_once(
                         iou_threshold=args.detector_merge_iou,
                     )
 
-        if accuracy_priority and len(full_detections) < target_count:
+        if accuracy_priority and len(full_detections) < accuracy_target_count:
             enhanced_frame = enhance_plate_frame(frame)
             enhanced_detections = detect_on_full_image(enhanced_frame, full_frame_width)
             if enhanced_detections:
@@ -1843,6 +1890,17 @@ def parse_args() -> argparse.Namespace:
         help="从 SD 卡或本地文件系统读取单张图片；留空时继续使用摄像头",
     )
     parser.add_argument(
+        "--image-refresh-fps",
+        type=float,
+        default=10.0,
+        help="静态图片的界面刷新率；限制重复处理速度，避免占满 ARM，默认 10 FPS",
+    )
+    parser.add_argument(
+        "--disable-sd-image-accuracy",
+        action="store_true",
+        help="关闭静态图片自动多尺度补检，仅用于性能或 A/B 对比",
+    )
+    parser.add_argument(
         "--input-video",
         "--sd-video",
         dest="input_video",
@@ -2006,11 +2064,29 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def configure_static_image_profile(args: argparse.Namespace) -> bool:
+    """静态高分辨率图片优先保证小车牌召回，不改变摄像头和视频参数。"""
+    if not getattr(args, "input_image", "") or getattr(args, "disable_sd_image_accuracy", False):
+        return False
+
+    args.detector_accuracy_priority = True
+    args.detector_interval = 1
+    args.detector_interval_hit = 1
+    args.detector_submit_max_gap_seconds = 0.0
+    if args.detector == "rknn":
+        args.rknn_conf_threshold = min(args.rknn_conf_threshold, 0.10)
+        if args.detector_fast_pass_width <= 0:
+            args.detector_fast_pass_width = args.rknn_input_size
+    return True
+
+
 def main() -> None:
     args = parse_args()
 
     if args.input_image and args.input_video:
         raise ValueError("--input-image/--sd-image 与 --input-video/--sd-video 不能同时使用")
+    static_image_mode = bool(args.input_image)
+    static_accuracy_profile = configure_static_image_profile(args)
     if args.metrics_ground_truth and not args.metrics_dir:
         raise ValueError("使用 --metrics-ground-truth 时必须同时指定 --metrics-dir")
     if not 0.0 <= args.metrics_iou_threshold <= 1.0:
@@ -2023,6 +2099,8 @@ def main() -> None:
         raise ValueError("mask-kernel 必须大于等于 1")
     if args.camera_fps < 0:
         raise ValueError("camera-fps 不能小于 0")
+    if args.image_refresh_fps <= 0:
+        raise ValueError("image-refresh-fps 必须大于 0")
     args.camera_fourcc = args.camera_fourcc.strip().upper()
     if args.camera_fourcc and len(args.camera_fourcc) != 4:
         raise ValueError("camera-fourcc 必须是四个字符，例如 MJPG")
@@ -2174,7 +2252,14 @@ def main() -> None:
     startup_status = fpga.ensure_signature()
     fpga_runner = AsyncFpgaRunner(fpga, args, startup_status)
     if args.input_image:
-        print(f"Input image ready: {Path(args.input_image).expanduser()}", flush=True)
+        print(
+            "Input image ready:",
+            f"path={Path(args.input_image).expanduser()}",
+            f"mode={int(round(cap.get(cv2.CAP_PROP_FRAME_WIDTH)))}x{int(round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))}",
+            f"refresh_fps={args.image_refresh_fps:.1f}",
+            f"accuracy_profile={'on' if static_accuracy_profile else 'off'}",
+            flush=True,
+        )
     elif args.input_video:
         print(
             "Input video ready:",
@@ -2272,11 +2357,14 @@ def main() -> None:
     display_detector_mode = "idle"
     status_detector_mode = "idle"
     detector_busy = False
+    detector_completed_generation = 0
     detector_latest_update_time = 0.0
     detector_duration_ms = 0.0
     last_detector_submit_time = 0.0
+    static_detector_submitted = False
     fpga_busy = False
     fpga_duration_ms = 0.0
+    static_fpga_submitted = False
     box_tracker = None if args.disable_box_tracking else BoxMotionTracker()
     person_tracker = (
         BoxMotionTracker()
@@ -2300,6 +2388,7 @@ def main() -> None:
     person_completed_generation = 0
     person_latest_update_time = 0.0
     person_duration_ms = 0.0
+    static_person_submit_count = 0
     last_violation_count = 0
     display_violations: List[Detection] = []
     source_description = describe_frame_source(cap, args)
@@ -2354,10 +2443,19 @@ def main() -> None:
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             display_violations = []
-            if person_runner is not None and (
-                total_frames == 0 or total_frames % args.person_interval == 0
-            ):
+            if static_image_mode:
+                person_submit_due = (
+                    detector_completed_generation > 0
+                    and static_person_submit_count < max(1, args.person_confirmation_hits)
+                )
+            else:
+                person_submit_due = (
+                    total_frames == 0 or total_frames % args.person_interval == 0
+                )
+            if person_runner is not None and person_submit_due:
                 person_runner.submit(frame)
+                if static_image_mode:
+                    static_person_submit_count += 1
             if person_runner is not None:
                 (
                     cached_people,
@@ -2375,7 +2473,11 @@ def main() -> None:
                 person_result_age = time.monotonic() - person_latest_update_time
                 display_people = (
                     list(tracked_people)
-                    if tracked_people and person_result_age <= args.person_hold_seconds
+                    if tracked_people
+                    and (
+                        static_image_mode
+                        or person_result_age <= args.person_hold_seconds
+                    )
                     else []
                 )
                 if violation_monitor is not None:
@@ -2392,7 +2494,9 @@ def main() -> None:
                         now=violation_now,
                     )
             fpga_gray = cv2.resize(gray, (args.fpga_width, args.fpga_height), interpolation=cv2.INTER_AREA)
-            fpga_runner.submit(fpga_gray)
+            if not static_image_mode or not static_fpga_submitted:
+                fpga_runner.submit(fpga_gray)
+                static_fpga_submitted = True
             (
                 status,
                 mask_small,
@@ -2466,7 +2570,15 @@ def main() -> None:
                 args.detector_submit_max_gap_seconds > 0
                 and (now_submit - last_detector_submit_time) >= args.detector_submit_max_gap_seconds
             )
-            if detector_runner is not None and (submit_due_by_frame or submit_due_by_time):
+            detector_submit_due = (
+                (
+                    not static_detector_submitted
+                    and (fpga_completed_generation > 0 or total_frames >= 3)
+                )
+                if static_image_mode
+                else (submit_due_by_frame or submit_due_by_time)
+            )
+            if detector_runner is not None and detector_submit_due:
                 detector_runner.submit(
                     frame,
                     gray,
@@ -2476,6 +2588,8 @@ def main() -> None:
                     source_name=source_name,
                 )
                 last_detector_submit_time = now_submit
+                if static_image_mode:
+                    static_detector_submitted = True
 
             if detector_runner is not None:
                 (
@@ -2530,7 +2644,11 @@ def main() -> None:
                 hold_age = time.monotonic() - detector_latest_update_time
                 display_detections = (
                     list(tracked_detections)
-                    if tracked_detections and hold_age <= max(args.box_hold_seconds, 0.0)
+                    if tracked_detections
+                    and (
+                        static_image_mode
+                        or hold_age <= max(args.box_hold_seconds, 0.0)
+                    )
                     else []
                 )
             elif tracked_detections and detector_completed_generation > last_drawn_completed_generation:

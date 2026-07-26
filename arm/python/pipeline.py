@@ -2542,6 +2542,9 @@ def main() -> None:
             unicode_font_cache[font_size] = resolve_text_font(args.text_font, font_size)
         return unicode_font_cache[font_size]
 
+    # 启动阶段先加载默认字体，供中文字体可用性检查和首帧绘制使用。
+    unicode_font = unicode_font_for_size(args.text_font_size)
+
     startup_status = fpga.ensure_signature()
     fpga_runner = AsyncFpgaRunner(fpga, args, startup_status)
     if args.input_image:

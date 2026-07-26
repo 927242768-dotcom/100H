@@ -12,6 +12,8 @@ from pipeline import (
     AsyncFrameDetectorRunner,
     StaticImageSource,
     build_static_image_tiles,
+    calculate_overlay_source_scale,
+    configured_display_size,
     configure_static_image_profile,
     deduplicate_static_plate_detections,
     image_navigation_step,
@@ -157,6 +159,30 @@ class StaticImageProfileTest(unittest.TestCase):
         for key in (8, 127, ord("a"), 65361):
             self.assertEqual(image_navigation_step(key), -1)
         self.assertEqual(image_navigation_step(ord("q")), 0)
+
+    def test_hdmi_overlay_scale_compensates_large_static_image(self):
+        self.assertEqual(
+            calculate_overlay_source_scale(3840, 2160, 1280, 720),
+            3.0,
+        )
+        self.assertEqual(
+            calculate_overlay_source_scale(1280, 720, 1280, 720),
+            1.0,
+        )
+        self.assertEqual(
+            calculate_overlay_source_scale(1280, 720, 1920, 1080),
+            1.0,
+        )
+
+    def test_single_display_dimension_preserves_aspect_ratio(self):
+        self.assertEqual(
+            configured_display_size(3840, 2160, 1280, 0),
+            (1280, 720),
+        )
+        self.assertEqual(
+            configured_display_size(3840, 2160, 0, 720),
+            (1280, 720),
+        )
 
     def test_async_frame_reset_discards_previous_image(self):
         class BlockingDetector:

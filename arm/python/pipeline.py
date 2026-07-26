@@ -415,6 +415,48 @@ def resize_for_display(image: np.ndarray, width: int, height: int) -> np.ndarray
     return cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
 
 
+def calculate_overlay_source_scale(
+    source_width: int,
+    source_height: int,
+    display_width: int,
+    display_height: int,
+) -> float:
+    """计算在原图上绘制时所需的补偿倍率，避免缩放到 HDMI 后文字过小。"""
+    if min(source_width, source_height, display_width, display_height) <= 0:
+        return 1.0
+
+    render_scale = min(
+        display_width / float(source_width),
+        display_height / float(source_height),
+    )
+    if render_scale <= 0.0:
+        return 1.0
+    return max(1.0, 1.0 / render_scale)
+
+
+def configured_display_size(
+    source_width: int,
+    source_height: int,
+    display_width: int,
+    display_height: int,
+) -> Tuple[int, int]:
+    if display_width > 0 and display_height > 0:
+        return display_width, display_height
+    if display_width > 0:
+        inferred_height = max(
+            1,
+            int(round(source_height * display_width / max(source_width, 1))),
+        )
+        return display_width, inferred_height
+    if display_height > 0:
+        inferred_width = max(
+            1,
+            int(round(source_width * display_height / max(source_height, 1))),
+        )
+        return inferred_width, display_height
+    return source_width, source_height
+
+
 def expand_box(
     box: Tuple[int, int, int, int],
     image_width: int,
@@ -2209,7 +2251,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--display-height", type=parse_int_auto, default=0, help="显示窗口高度，0 表示不额外缩放")
     parser.add_argument("--window-name", default="rk3568_fpga_hdmi", help="显示窗口名称")
     parser.add_argument("--text-font", default="", help="中文绘制字体路径，留空时自动查找 HyperLPR 自带字体")
-    parser.add_argument("--text-font-size", type=parse_int_auto, default=28, help="中文绘制字体大小")
+    parser.add_argument("--text-font-size", type=parse_int_auto, default=32, help="底部中文结果摘要字体大小")
+    parser.add_argument("--label-font-size", type=parse_int_auto, default=36, help="车牌和行人框左上角标签字体大小")
+    parser.add_argument("--status-font-scale", type=float, default=1.0, help="底部英文状态栏字号倍率")
+    parser.add_argument("--status-font-thickness", type=parse_int_auto, default=3, help="底部英文状态栏笔画粗细")
     parser.add_argument("--draw-roi", action="store_true", help="在画面上额外绘制候选区域框")
     parser.add_argument("--hide-status", action="store_true", help="隐藏底部状态栏")
     parser.add_argument("--box-display-mode", choices=("hold", "flash"), default="hold", help="车牌框显示模式：hold=持续显示最近结果，flash=仅在新结果返回时闪一下")
@@ -2348,6 +2393,12 @@ def main() -> None:
         raise ValueError("detector-interval-hit 必须大于等于 1")
     if args.text_font_size < 8:
         raise ValueError("text-font-size 不能小于 8")
+    if args.label_font_size < 8:
+        raise ValueError("label-font-size 不能小于 8")
+    if args.status_font_scale <= 0.0:
+        raise ValueError("status-font-scale 必须大于 0")
+    if args.status_font_thickness < 1:
+        raise ValueError("status-font-thickness 必须大于等于 1")
     if args.detector_max_rois < 0:
         raise ValueError("detector-max-rois 不能小于 0")
     if not 0.0 <= args.detector_min_score <= 1.0:
@@ -2483,7 +2534,13 @@ def main() -> None:
     if not args.headless:
         prepare_window(args.window_name, args.fullscreen, args.display_width, args.display_height)
 
-    unicode_font = resolve_text_font(args.text_font, args.text_font_size)
+    unicode_font_cache = {}
+
+    def unicode_font_for_size(font_size: int):
+        font_size = max(8, int(font_size))
+        if font_size not in unicode_font_cache:
+            unicode_font_cache[font_size] = resolve_text_font(args.text_font, font_size)
+        return unicode_font_cache[font_size]
 
     startup_status = fpga.ensure_signature()
     fpga_runner = AsyncFpgaRunner(fpga, args, startup_status)
@@ -2899,7 +2956,54 @@ def main() -> None:
                 status_detections = list(cached_detections)
                 status_detector_mode = last_detector_mode
 
+            source_display_height, source_display_width = display.shape[:2]
+            target_display_width, target_display_height = configured_display_size(
+                source_display_width,
+                source_display_height,
+                args.display_width,
+                args.display_height,
+            )
+            if (
+                not args.headless
+                and args.display_width <= 0
+                and args.display_height <= 0
+                and hasattr(cv2, "getWindowImageRect")
+            ):
+                try:
+                    _, _, window_width, window_height = cv2.getWindowImageRect(args.window_name)
+                    if window_width > 0 and window_height > 0:
+                        target_display_width = window_width
+                        target_display_height = window_height
+                except cv2.error:
+                    pass
+
+            overlay_source_scale = calculate_overlay_source_scale(
+                source_display_width,
+                source_display_height,
+                target_display_width,
+                target_display_height,
+            )
+            effective_text_font_size = max(
+                8,
+                int(round(args.text_font_size * overlay_source_scale)),
+            )
+            effective_label_font_size = max(
+                8,
+                int(round(args.label_font_size * overlay_source_scale)),
+            )
+            effective_outline_thickness = max(
+                2,
+                int(round(2 * overlay_source_scale)),
+            )
+            effective_box_thickness = max(
+                2,
+                int(round(2 * overlay_source_scale)),
+            )
+            unicode_font = unicode_font_for_size(effective_text_font_size)
+            label_font = unicode_font_for_size(effective_label_font_size)
+
             unicode_items = []
+            label_items = []
             image_count = int(getattr(cap, "image_count", 1))
             image_index = int(getattr(cap, "image_index", 0))
             if static_image_mode and image_count > 1:
@@ -2934,14 +3038,25 @@ def main() -> None:
             for det in display_detections:
                 gx1, gy1, dw, dh = det.box
                 gx2, gy2 = gx1 + dw, gy1 + dh
-                cv2.rectangle(display, (gx1, gy1), (gx2, gy2), (0, 0, 255), 2)
-                unicode_items.append(
+                cv2.rectangle(
+                    display,
+                    (gx1, gy1),
+                    (gx2, gy2),
+                    (0, 0, 255),
+                    effective_box_thickness,
+                )
+                label_items.append(
                     {
                         "text": det.raw_label or det.label,
-                        "origin": (gx1, max(8, gy1 - args.text_font_size - 6)),
+                        "origin": (
+                            gx1,
+                            max(8, gy1 - effective_label_font_size - 6),
+                        ),
                         "color": (0, 0, 255),
                         "outline_color": (0, 0, 0),
-                        "outline_thickness": 2,
+                        "outline_thickness": effective_outline_thickness,
+                        "font_scale": max(0.8, effective_label_font_size / 36.0),
+                        "thickness": max(2, int(round(2 * overlay_source_scale))),
                     }
                 )
 
@@ -2955,15 +3070,23 @@ def main() -> None:
                     (gx1, gy1),
                     (gx2, gy2),
                     person_color,
-                    3 if is_violation else 2,
+                    max(
+                        effective_box_thickness,
+                        int(round((3 if is_violation else 2) * overlay_source_scale)),
+                    ),
                 )
-                unicode_items.append(
+                label_items.append(
                     {
                         "text": det.full_text or f"行人 {det.score:.0%}",
-                        "origin": (gx1, max(8, gy1 - args.text_font_size - 6)),
+                        "origin": (
+                            gx1,
+                            max(8, gy1 - effective_label_font_size - 6),
+                        ),
                         "color": person_color,
                         "outline_color": (0, 0, 0),
-                        "outline_thickness": 2,
+                        "outline_thickness": effective_outline_thickness,
+                        "font_scale": max(0.8, effective_label_font_size / 36.0),
+                        "thickness": max(2, int(round(2 * overlay_source_scale))),
                     }
                 )
 
@@ -2983,7 +3106,14 @@ def main() -> None:
             last_violation_count = len(display_violations)
             last_plate_text = status_detections[0].raw_label if status_detections else ""
             last_plate_summary = build_plate_summary(status_detections)
-            summary_chars_per_line = max(18, int((display.shape[1] - 40) / max(args.text_font_size, 1) * 1.3))
+            summary_chars_per_line = max(
+                18,
+                int(
+                    (display.shape[1] - 40)
+                    / max(effective_text_font_size, 1)
+                    * 1.3
+                ),
+            )
             summary_lines = build_plate_summary_lines(status_detections, summary_chars_per_line)
 
             total_frames += 1
@@ -3056,6 +3186,7 @@ def main() -> None:
                 if violation_monitor is not None
                 else ""
             )
+            draw_unicode_texts(display, label_items, label_font)
             if not args.hide_status:
                 info = (
                     f"FPS:{display_fps_value:.1f} "
@@ -3073,9 +3204,16 @@ def main() -> None:
                     display,
                     info,
                     (20, display.shape[0] - 20),
-                    font_scale=0.72,
+                    font_scale=args.status_font_scale * overlay_source_scale,
                     color=(255, 255, 255),
-                    thickness=2,
+                    thickness=max(
+                        1,
+                        int(round(args.status_font_thickness * overlay_source_scale)),
+                    ),
+                    outline_thickness=max(
+                        4,
+                        int(round((args.status_font_thickness + 2) * overlay_source_scale)),
+                    ),
                 )
                 for line_index, line_text in enumerate(reversed(summary_lines)):
                     unicode_items.append(
@@ -3083,11 +3221,23 @@ def main() -> None:
                             "text": line_text,
                             "origin": (
                                 20,
-                                max(8, display.shape[0] - args.text_font_size - 52 - line_index * (args.text_font_size + 10)),
+                                max(
+                                    8,
+                                    display.shape[0]
+                                    - effective_text_font_size
+                                    - int(round(64 * overlay_source_scale))
+                                    - line_index
+                                    * (
+                                        effective_text_font_size
+                                        + int(round(10 * overlay_source_scale))
+                                    ),
+                                ),
                             ),
                             "color": (0, 255, 0),
                             "outline_color": (0, 0, 0),
-                            "outline_thickness": 2,
+                            "outline_thickness": effective_outline_thickness,
+                            "font_scale": max(0.8, effective_text_font_size / 32.0),
+                            "thickness": max(2, int(round(2 * overlay_source_scale))),
                         }
                     )
 

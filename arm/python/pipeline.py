@@ -2970,7 +2970,7 @@ def main() -> None:
             detector_submit_due = (
                 (
                     not static_detector_submitted
-                    and (fpga_completed_generation > 0 or total_frames >= 3)
+                    and total_frames >= 1
                 )
                 if static_image_mode
                 else (submit_due_by_frame or submit_due_by_time)

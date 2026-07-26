@@ -142,6 +142,11 @@ class PedestrianViolationMonitor:
     def zone_pixels(self) -> List[PixelPoint]:
         return list(self._zone_pixels)
 
+    def reset(self) -> None:
+        self._tracks = {}
+        self._next_track_id = 1
+        self._last_generation = -1
+
     def _update_zone(self, frame_width: int, frame_height: int) -> None:
         frame_size = (frame_width, frame_height)
         if frame_size == self._frame_size:

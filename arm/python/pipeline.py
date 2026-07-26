@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -36,6 +37,30 @@ from pedestrian_violation import PedestrianViolationMonitor, parse_zone_points
 
 
 _UNICODE_TEXT_CACHE: Dict[Tuple[int, str, Tuple[int, int, int], Tuple[int, int, int], int], Tuple[np.ndarray, int, int]] = {}
+_IMAGE_FILE_SUFFIXES = frozenset(
+    (".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".webp", ".tif", ".tiff")
+)
+_NEXT_IMAGE_KEYS = frozenset((10, 13, 32, ord("d"), ord("n"), 65363, 2555904))
+_PREVIOUS_IMAGE_KEYS = frozenset((8, 127, ord("a"), ord("p"), 65361, 2424832))
+
+
+def _natural_text_key(value: str) -> Tuple[object, ...]:
+    return tuple(
+        int(part) if part.isdigit() else part.casefold()
+        for part in re.split(r"(\d+)", value)
+    )
+
+
+def _natural_path_key(path: Path) -> Tuple[Tuple[object, ...], Tuple[object, ...]]:
+    return _natural_text_key(path.name), _natural_text_key(str(path.parent))
+
+
+def image_navigation_step(key: int) -> int:
+    if key in _NEXT_IMAGE_KEYS:
+        return 1
+    if key in _PREVIOUS_IMAGE_KEYS:
+        return -1
+    return 0
 
 
 def build_candidate_boxes(mask: np.ndarray, min_area: int = 40) -> List[Tuple[int, int, int, int]]:
@@ -1061,24 +1086,72 @@ class LatestFrameCamera:
 
 
 class StaticImageSource:
-    """将单张图片作为持续帧源，便于直接读取 SD 卡测试图片。"""
+    """将单张图片或图片目录作为可交互浏览的持续帧源。"""
 
     def __init__(self, image_path: str, *, refresh_fps: float = 10.0) -> None:
         expanded_path = os.path.expandvars(os.path.expanduser(image_path))
         self.path = Path(expanded_path).resolve()
-        if not self.path.is_file():
-            raise FileNotFoundError(f"输入图片不存在: {self.path}")
+        if self.path.is_file():
+            self._image_paths = [self.path]
+        elif self.path.is_dir():
+            self._image_paths = sorted(
+                (
+                    candidate.resolve()
+                    for candidate in self.path.rglob("*")
+                    if candidate.is_file()
+                    and candidate.suffix.casefold() in _IMAGE_FILE_SUFFIXES
+                ),
+                key=_natural_path_key,
+            )
+        else:
+            raise FileNotFoundError(f"输入图片或目录不存在: {self.path}")
+        if not self._image_paths:
+            raise RuntimeError(f"目录中未找到支持的图片: {self.path}")
 
-        self._frame = cv2.imread(str(self.path), cv2.IMREAD_COLOR)
-        if self._frame is None:
-            raise RuntimeError(f"输入图片无法解码或格式不受支持: {self.path}")
+        self._image_index = 0
+        self._frame: np.ndarray | None = None
         self.source_kind = "image"
-        self.current_frame_index = 1
         self.current_timestamp_seconds = 0.0
-        self.current_source_name = self.path.name
         self._refresh_fps = max(1.0, float(refresh_fps))
         self._frame_interval = 1.0 / self._refresh_fps
         self._next_frame_time = 0.0
+        self._load_from_index(0, direction=1)
+
+    @property
+    def image_count(self) -> int:
+        return len(self._image_paths)
+
+    @property
+    def image_index(self) -> int:
+        return self._image_index
+
+    @property
+    def current_path(self) -> Path:
+        return self._image_paths[self._image_index]
+
+    def _load_from_index(self, target_index: int, *, direction: int) -> None:
+        step = 1 if direction >= 0 else -1
+        for offset in range(len(self._image_paths)):
+            index = (target_index + offset * step) % len(self._image_paths)
+            candidate = self._image_paths[index]
+            frame = cv2.imread(str(candidate), cv2.IMREAD_COLOR)
+            if frame is None:
+                continue
+            self._image_index = index
+            self._frame = frame
+            self.current_frame_index = index + 1
+            self.current_source_name = candidate.name
+            self._next_frame_time = 0.0
+            return
+        raise RuntimeError(f"目录中的图片均无法解码: {self.path}")
+
+    def move(self, step: int) -> bool:
+        if step == 0 or len(self._image_paths) <= 1:
+            return False
+        target_index = (self._image_index + step) % len(self._image_paths)
+        previous_index = self._image_index
+        self._load_from_index(target_index, direction=step)
+        return self._image_index != previous_index
 
     def isOpened(self) -> bool:
         return self._frame is not None
@@ -1103,7 +1176,7 @@ class StaticImageSource:
         if property_id == cv2.CAP_PROP_FPS:
             return self._refresh_fps
         if property_id == cv2.CAP_PROP_FRAME_COUNT:
-            return 1.0
+            return float(len(self._image_paths))
         return 0.0
 
 
@@ -1305,6 +1378,7 @@ class AsyncFpgaRunner:
         self._stopped = False
         self._submit_generation = 0
         self._completed_generation = 0
+        self._discard_before_generation = 0
         self._last_duration_ms = 0.0
         self._error: Exception | None = None
         self._thread = threading.Thread(target=self._worker, daemon=True)
@@ -1329,6 +1403,18 @@ class AsyncFpgaRunner:
                 self._completed_generation,
                 self._last_duration_ms,
             )
+
+    def reset(self) -> None:
+        with self._lock:
+            self._pending = None
+            self._discard_before_generation = self._submit_generation + 1
+            self._mask = np.zeros(
+                (self._args.fpga_height, self._args.fpga_width),
+                dtype=np.uint8,
+            )
+            self._boxes = []
+            self._completed_generation = 0
+            self._last_duration_ms = 0.0
 
     def close(self) -> None:
         with self._lock:
@@ -1382,6 +1468,9 @@ class AsyncFpgaRunner:
                 return
 
             with self._lock:
+                if generation < self._discard_before_generation:
+                    self._busy = False
+                    continue
                 self._status = status
                 self._mask = mask
                 self._boxes = boxes
@@ -1459,6 +1548,7 @@ def run_detector_once(
     *,
     extra_roi_boxes: List[Tuple[int, int, int, int]] | None = None,
     allow_full_frame: bool = True,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> Tuple[List[Detection], str]:
     full_detections: List[Detection] = []
     roi_detections: List[Detection] = []
@@ -1468,7 +1558,12 @@ def run_detector_once(
     if accuracy_priority:
         effective_min_score = min(effective_min_score, 0.02)
 
+    def cancelled() -> bool:
+        return bool(cancel_check is not None and cancel_check())
+
     def detect_on_full_image(source_image: np.ndarray, target_width: int) -> List[Detection]:
+        if cancelled():
+            return []
         if args.detector == "rknn":
             return [
                 det
@@ -1488,6 +1583,9 @@ def run_detector_once(
             for det in detector.detect(detector_frame)
             if det.score >= effective_min_score
         ]
+
+    if cancelled():
+        return [], "cancelled"
 
     def offset_detections(
         detections: List[Detection],
@@ -1527,6 +1625,8 @@ def run_detector_once(
             full_frame_width = args.detector_input_width
 
         full_detections = detect_on_full_image(frame, full_frame_width)
+        if cancelled():
+            return [], "cancelled"
         if accuracy_priority:
             detection_tiles = (
                 build_static_image_tiles(frame.shape[1], frame.shape[0])
@@ -1535,6 +1635,8 @@ def run_detector_once(
             )
             tile_detections: List[Detection] = []
             for tile_x, tile_y, tile_w, tile_h in detection_tiles:
+                if cancelled():
+                    return [], "cancelled"
                 tile = frame[tile_y:tile_y + tile_h, tile_x:tile_x + tile_w]
                 if tile.size == 0:
                     continue
@@ -1553,9 +1655,13 @@ def run_detector_once(
                 )
 
             if len(full_detections) < accuracy_target_count:
+                if cancelled():
+                    return [], "cancelled"
                 enhanced_tile_detections: List[Detection] = []
                 enhanced_frame_for_tiles = enhance_plate_frame(frame)
                 for tile_x, tile_y, tile_w, tile_h in detection_tiles:
+                    if cancelled():
+                        return [], "cancelled"
                     tile = enhanced_frame_for_tiles[tile_y:tile_y + tile_h, tile_x:tile_x + tile_w]
                     if tile.size == 0:
                         continue
@@ -1574,6 +1680,8 @@ def run_detector_once(
                     )
 
         if accuracy_priority and len(full_detections) < accuracy_target_count:
+            if cancelled():
+                return [], "cancelled"
             enhanced_frame = enhance_plate_frame(frame)
             enhanced_detections = detect_on_full_image(enhanced_frame, full_frame_width)
             if enhanced_detections:
@@ -1602,6 +1710,8 @@ def run_detector_once(
                 iou_threshold=args.detector_box_merge_iou,
             )
         for roi_box in detector_boxes:
+            if cancelled():
+                return [], "cancelled"
             x, y, w, h = expand_box(
                 roi_box,
                 frame.shape[1],
@@ -1627,6 +1737,8 @@ def run_detector_once(
                     )
                 )
             if accuracy_priority and not roi_detections:
+                if cancelled():
+                    return [], "cancelled"
                 enhanced_crop = enhance_plate_frame(crop)
                 for det in detector.detect(enhanced_crop):
                     if det.score < effective_min_score:
@@ -1660,6 +1772,8 @@ def run_detector_once(
 
     if accuracy_priority and getattr(args, "input_image", ""):
         detections = deduplicate_static_plate_detections(detections)
+    if cancelled():
+        return [], "cancelled"
     return detections, detector_mode
 
 
@@ -1694,6 +1808,8 @@ class AsyncDetectorRunner:
         self._completed_mode = "idle"
         self._miss_count = 0
         self._last_success_time = 0.0
+        self._discard_before_generation = 0
+        self._reset_requested = False
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
@@ -1748,21 +1864,55 @@ class AsyncDetectorRunner:
                 self._completed_mode,
             )
 
+    def reset(self) -> None:
+        with self._lock:
+            self._pending = None
+            self._discard_before_generation = self._submit_generation + 1
+            self._reset_requested = True
+            self._latest = []
+            self._latest_source_gray = None
+            self._latest_mode = "idle"
+            self._completed_generation = 0
+            self._latest_update_time = 0.0
+            self._last_duration_ms = 0.0
+            self._completed_result = []
+            self._completed_source_frame = 0
+            self._completed_source_time = 0.0
+            self._completed_source_name = ""
+            self._completed_mode = "idle"
+            self._miss_count = 0
+            self._last_success_time = 0.0
+            self._submit_count = 0
+
     def close(self) -> None:
         with self._lock:
             self._stopped = True
         self._thread.join(timeout=1.0)
+
+    def _generation_cancelled(self, generation: int) -> bool:
+        with self._lock:
+            return self._stopped or generation < self._discard_before_generation
 
     def _worker(self) -> None:
         while True:
             with self._lock:
                 if self._stopped:
                     return
-                task = self._pending
-                latest_snapshot = list(self._latest)
-                if task is not None:
-                    self._pending = None
-                    self._busy = True
+                reset_requested = self._reset_requested
+                if reset_requested:
+                    self._reset_requested = False
+                    task = None
+                    latest_snapshot = []
+                else:
+                    task = self._pending
+                    latest_snapshot = list(self._latest)
+                    if task is not None:
+                        self._pending = None
+                        self._busy = True
+
+            if reset_requested:
+                self._detector.reset()
+                continue
 
             if task is None:
                 time.sleep(0.005)
@@ -1803,15 +1953,17 @@ class AsyncDetectorRunner:
                     fast_args,
                     extra_roi_boxes=None,
                     allow_full_frame=True,
+                    cancel_check=lambda: self._generation_cancelled(generation),
                 )
                 if fast_detections:
                     with self._lock:
-                        self._latest = fast_detections
-                        self._latest_mode = "quick"
-                        self._latest_update_time = time.monotonic()
-                        self._latest_source_gray = source_gray
-                        self._miss_count = 0
-                        self._last_success_time = time.monotonic()
+                        if generation >= self._discard_before_generation:
+                            self._latest = fast_detections
+                            self._latest_mode = "quick"
+                            self._latest_update_time = time.monotonic()
+                            self._latest_source_gray = source_gray
+                            self._miss_count = 0
+                            self._last_success_time = time.monotonic()
 
             allow_full_frame = True
             if self._args.detector_source == "roi":
@@ -1830,9 +1982,13 @@ class AsyncDetectorRunner:
                 self._args,
                 extra_roi_boxes=extra_roi_boxes,
                 allow_full_frame=allow_full_frame,
+                cancel_check=lambda: self._generation_cancelled(generation),
             )
 
             with self._lock:
+                if generation < self._discard_before_generation:
+                    self._busy = False
+                    continue
                 self._completed_generation = generation
                 metric_detections: List[Detection] = []
                 if detections:
@@ -1879,6 +2035,8 @@ class AsyncFrameDetectorRunner:
         self._stopped = False
         self._submit_generation = 0
         self._completed_generation = 0
+        self._discard_before_generation = 0
+        self._reset_requested = False
         self._latest_update_time = 0.0
         self._last_duration_ms = 0.0
         self._thread = threading.Thread(target=self._worker, daemon=True)
@@ -1900,6 +2058,16 @@ class AsyncFrameDetectorRunner:
                 self._last_duration_ms,
             )
 
+    def reset(self) -> None:
+        with self._lock:
+            self._pending = None
+            self._discard_before_generation = self._submit_generation + 1
+            self._reset_requested = True
+            self._latest = []
+            self._completed_generation = 0
+            self._latest_update_time = 0.0
+            self._last_duration_ms = 0.0
+
     def close(self) -> None:
         with self._lock:
             self._stopped = True
@@ -1910,10 +2078,19 @@ class AsyncFrameDetectorRunner:
             with self._lock:
                 if self._stopped:
                     return
-                task = self._pending
-                if task is not None:
-                    self._pending = None
-                    self._busy = True
+                reset_requested = self._reset_requested
+                if reset_requested:
+                    self._reset_requested = False
+                    task = None
+                else:
+                    task = self._pending
+                    if task is not None:
+                        self._pending = None
+                        self._busy = True
+
+            if reset_requested:
+                self._detector.reset()
+                continue
 
             if task is None:
                 time.sleep(0.005)
@@ -1928,6 +2105,9 @@ class AsyncFrameDetectorRunner:
                 detections = []
 
             with self._lock:
+                if generation < self._discard_before_generation:
+                    self._busy = False
+                    continue
                 self._latest = detections
                 self._completed_generation = generation
                 self._latest_update_time = time.monotonic()
@@ -1943,7 +2123,7 @@ def parse_args() -> argparse.Namespace:
         "--sd-image",
         dest="input_image",
         default="",
-        help="从 SD 卡或本地文件系统读取单张图片；留空时继续使用摄像头",
+        help="读取单张图片或递归扫描图片目录；目录模式下可用按键切换，留空时使用摄像头",
     )
     parser.add_argument(
         "--image-refresh-fps",
@@ -2312,6 +2492,8 @@ def main() -> None:
             "Input image ready:",
             f"path={Path(args.input_image).expanduser()}",
             f"mode={int(round(cap.get(cv2.CAP_PROP_FRAME_WIDTH)))}x{int(round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))}",
+            f"images={int(round(cap.get(cv2.CAP_PROP_FRAME_COUNT)))}",
+            f"current={getattr(cap, 'current_source_name', '')}",
             f"refresh_fps={args.image_refresh_fps:.1f}",
             f"accuracy_profile={'on' if static_accuracy_profile else 'off'}",
             flush=True,
@@ -2718,6 +2900,22 @@ def main() -> None:
                 status_detector_mode = last_detector_mode
 
             unicode_items = []
+            image_count = int(getattr(cap, "image_count", 1))
+            image_index = int(getattr(cap, "image_index", 0))
+            if static_image_mode and image_count > 1:
+                unicode_items.append(
+                    {
+                        "text": (
+                            f"图片 {image_index + 1}/{image_count}: "
+                            f"{getattr(cap, 'current_source_name', '')}  "
+                            "Enter/空格/右键: 下一张  左键/Backspace: 上一张"
+                        ),
+                        "origin": (20, 16),
+                        "color": (0, 220, 255),
+                        "outline_color": (0, 0, 0),
+                        "outline_thickness": 2,
+                    }
+                )
             if (
                 violation_monitor is not None
                 and not args.hide_pedestrian_zone
@@ -2935,9 +3133,73 @@ def main() -> None:
             if not args.headless:
                 screen_frame = resize_for_display(display, args.display_width, args.display_height)
                 cv2.imshow(args.window_name, screen_frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord("q")):
+                key = (
+                    cv2.waitKeyEx(1)
+                    if static_image_mode
+                    else (cv2.waitKey(1) & 0xFF)
+                )
+                if key in (27, ord("q"), ord("Q")):
                     break
+                navigation_step = image_navigation_step(key)
+                if (
+                    static_image_mode
+                    and navigation_step != 0
+                    and hasattr(cap, "move")
+                    and cap.move(navigation_step)
+                ):
+                    fpga_runner.reset()
+                    if detector_runner is not None:
+                        detector_runner.reset()
+                    if person_runner is not None:
+                        person_runner.reset()
+                    if violation_monitor is not None:
+                        violation_monitor.reset()
+
+                    cached_detections = []
+                    display_detections = []
+                    status_detections = []
+                    cached_people = []
+                    display_people = []
+                    display_violations = []
+                    last_box_count = 0
+                    last_plate_count = 0
+                    last_plate_text = ""
+                    last_plate_summary = ""
+                    last_person_count = 0
+                    last_violation_count = 0
+                    last_drawn_completed_generation = 0
+                    last_detector_mode = "idle"
+                    display_detector_mode = "idle"
+                    status_detector_mode = "idle"
+                    detector_busy = False
+                    detector_completed_generation = 0
+                    detector_latest_update_time = 0.0
+                    detector_duration_ms = 0.0
+                    last_detector_submit_time = 0.0
+                    person_busy = False
+                    person_completed_generation = 0
+                    person_latest_update_time = 0.0
+                    person_duration_ms = 0.0
+                    fpga_busy = False
+                    fpga_duration_ms = 0.0
+                    static_detector_submitted = False
+                    static_fpga_submitted = False
+                    static_person_submit_count = 0
+                    last_metrics_detector_generation = 0
+                    last_metrics_fpga_generation = 0
+                    last_metrics_person_generation = 0
+                    box_tracker = None if args.disable_box_tracking else BoxMotionTracker()
+                    person_tracker = (
+                        BoxMotionTracker()
+                        if person_runner is not None and not args.disable_box_tracking
+                        else None
+                    )
+                    print(
+                        "Input image switched:",
+                        f"index={cap.image_index + 1}/{cap.image_count}",
+                        f"path={cap.current_path}",
+                        flush=True,
+                    )
 
             if args.max_frames > 0 and total_frames >= args.max_frames:
                 break

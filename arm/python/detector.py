@@ -30,6 +30,9 @@ class BaseDetector:
     def detect(self, image) -> List[Detection]:
         raise NotImplementedError
 
+    def reset(self) -> None:
+        pass
+
     def close(self) -> None:
         pass
 
@@ -1022,6 +1025,11 @@ class RknnLiteDetector(BaseDetector):
             finally:
                 self._rknn = None
 
+    def reset(self) -> None:
+        self._ocr_cache = []
+        if self._recognizer is not None:
+            self._recognizer.reset()
+
 
 @dataclass
 class _PersonTrack:
@@ -1213,3 +1221,7 @@ class PersonRknnDetector(BaseDetector):
     def close(self) -> None:
         self._tracks = []
         self._detector.close()
+
+    def reset(self) -> None:
+        self._tracks = []
+        self._detector.reset()

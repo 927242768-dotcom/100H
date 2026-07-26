@@ -44,13 +44,14 @@ lsblk -f
 findmnt -t vfat,exfat,ext4
 ```
 
-静态图片与摄像头共用同一条 FPGA、RKNN、OCR 和 HDMI 显示链路。把原命令中的
-`--camera 0` 保留或删除均可，再增加图片参数即可：
+静态图片与摄像头共用同一条 FPGA、RKNN、OCR 和 HDMI 显示链路。`--sd-image`
+既可以接收单个图片文件，也可以接收SD卡目录；目录模式会递归扫描支持的图片并
+按文件名自然排序：
 
 ```bash
 sudo -E python3 pipeline.py \
   --resource-root /sys/bus/pci/devices/0002:21:00.0 \
-  --sd-image /media/linaro/SDCARD/test.jpg \
+  --sd-image /mnt/sdcard \
   --fpga-width 112 \
   --fpga-height 64 \
   --morph-cfg 0x94 \
@@ -67,8 +68,10 @@ sudo -E python3 pipeline.py \
   --fullscreen
 ```
 
-`--sd-image` 是 `--input-image` 的别名。程序会重复处理该图片，适合对比 FPGA
-配置、检测阈值和 OCR 结果；不传该参数时仍从摄像头读取。
+`--sd-image` 是 `--input-image` 的别名。目录模式下，按 `Enter`、空格、右方向键、
+`D` 或 `N` 切到下一张；按左方向键、Backspace、`A` 或 `P` 返回上一张；按 `Q`
+或 `Esc` 退出。切图时会清空上一张的异步检测、OCR缓存和跟踪结果。不传该参数时
+仍从摄像头读取，摄像头处理逻辑不受影响。
 
 ## SD卡视频与自动化测试
 

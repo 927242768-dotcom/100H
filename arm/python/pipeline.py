@@ -330,6 +330,13 @@ def build_plate_summary_lines(detections: List[Detection], max_chars_per_line: i
         return []
 
     texts = [det.full_text or det.raw_label or det.label for det in detections]
+    return build_summary_lines(texts, max_chars_per_line)
+
+
+def build_summary_lines(texts: List[str], max_chars_per_line: int) -> List[str]:
+    if not texts:
+        return []
+
     lines: List[str] = []
     current = ""
 
@@ -455,6 +462,41 @@ def configured_display_size(
         )
         return inferred_width, display_height
     return source_width, source_height
+
+
+def compose_static_image_canvas(
+    image: np.ndarray,
+    target_width: int,
+    target_height: int,
+    panel_height: int,
+) -> Tuple[np.ndarray, Tuple[int, int, int, int], int]:
+    """将静态图片等比放入黑色画布，并在底部预留固定信息栏。"""
+    target_width = max(1, int(target_width))
+    target_height = max(2, int(target_height))
+    panel_height = max(1, min(int(panel_height), target_height - 1))
+    content_height = target_height - panel_height
+    source_height, source_width = image.shape[:2]
+    scale = min(
+        target_width / max(source_width, 1),
+        content_height / max(source_height, 1),
+    )
+    render_width = max(1, min(target_width, int(round(source_width * scale))))
+    render_height = max(1, min(content_height, int(round(source_height * scale))))
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(
+        image,
+        (render_width, render_height),
+        interpolation=interpolation,
+    )
+
+    canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+    offset_x = (target_width - render_width) // 2
+    offset_y = (content_height - render_height) // 2
+    canvas[
+        offset_y:offset_y + render_height,
+        offset_x:offset_x + render_width,
+    ] = resized
+    return canvas, (offset_x, offset_y, render_width, render_height), content_height
 
 
 def expand_box(
@@ -1591,6 +1633,7 @@ def run_detector_once(
     extra_roi_boxes: List[Tuple[int, int, int, int]] | None = None,
     allow_full_frame: bool = True,
     cancel_check: Callable[[], bool] | None = None,
+    progress_callback: Callable[[List[Detection], str], None] | None = None,
 ) -> Tuple[List[Detection], str]:
     full_detections: List[Detection] = []
     roi_detections: List[Detection] = []
@@ -1602,6 +1645,14 @@ def run_detector_once(
 
     def cancelled() -> bool:
         return bool(cancel_check is not None and cancel_check())
+
+    def publish_progress(detections: List[Detection], mode: str) -> None:
+        if progress_callback is None or not detections or cancelled():
+            return
+        partial = list(detections)
+        if accuracy_priority and getattr(args, "input_image", ""):
+            partial = deduplicate_static_plate_detections(partial)
+        progress_callback(partial, mode)
 
     def detect_on_full_image(source_image: np.ndarray, target_width: int) -> List[Detection]:
         if cancelled():
@@ -1669,6 +1720,7 @@ def run_detector_once(
         full_detections = detect_on_full_image(frame, full_frame_width)
         if cancelled():
             return [], "cancelled"
+        publish_progress(full_detections, "full_progress")
         if accuracy_priority:
             detection_tiles = (
                 build_static_image_tiles(frame.shape[1], frame.shape[0])
@@ -1688,6 +1740,14 @@ def run_detector_once(
                         tile_detections,
                         offset_detections(tile_results, tile_x, tile_y),
                         iou_threshold=args.detector_merge_iou,
+                    )
+                    publish_progress(
+                        merge_detections(
+                            full_detections,
+                            tile_detections,
+                            iou_threshold=args.detector_merge_iou,
+                        ),
+                        "tile_progress",
                     )
             if tile_detections:
                 full_detections = merge_detections(
@@ -1714,6 +1774,14 @@ def run_detector_once(
                             offset_detections(tile_results, tile_x, tile_y),
                             iou_threshold=args.detector_merge_iou,
                         )
+                        publish_progress(
+                            merge_detections(
+                                full_detections,
+                                enhanced_tile_detections,
+                                iou_threshold=args.detector_merge_iou,
+                            ),
+                            "enhanced_tile_progress",
+                        )
                 if enhanced_tile_detections:
                     full_detections = merge_detections(
                         full_detections,
@@ -1732,6 +1800,7 @@ def run_detector_once(
                     enhanced_detections,
                     iou_threshold=max(0.35, args.detector_merge_iou),
                 )
+                publish_progress(full_detections, "enhanced_progress")
         if full_detections:
             detector_mode = "full"
 
@@ -1935,6 +2004,24 @@ class AsyncDetectorRunner:
         with self._lock:
             return self._stopped or generation < self._discard_before_generation
 
+    def _publish_progress(
+        self,
+        detections: List[Detection],
+        mode: str,
+        generation: int,
+        source_gray: np.ndarray,
+    ) -> None:
+        """静态图片高精度扫描期间逐步发布累积结果，不等待全部切片结束。"""
+        with self._lock:
+            if self._stopped or generation < self._discard_before_generation:
+                return
+            self._latest = list(detections)
+            self._latest_mode = mode
+            self._latest_update_time = time.monotonic()
+            self._latest_source_gray = source_gray
+            self._miss_count = 0
+            self._last_success_time = self._latest_update_time
+
     def _worker(self) -> None:
         while True:
             with self._lock:
@@ -2017,6 +2104,14 @@ class AsyncDetectorRunner:
                     period = max(1, self._args.detector_fullframe_period)
                     allow_full_frame = (self._submit_count % period) == 0
 
+            progress_callback = None
+            if getattr(self._args, "input_image", ""):
+                progress_callback = lambda partial, mode: self._publish_progress(
+                    partial,
+                    mode,
+                    generation,
+                    source_gray,
+                )
             detections, detector_mode = run_detector_once(
                 self._detector,
                 frame,
@@ -2025,6 +2120,7 @@ class AsyncDetectorRunner:
                 extra_roi_boxes=extra_roi_boxes,
                 allow_full_frame=allow_full_frame,
                 cancel_check=lambda: self._generation_cancelled(generation),
+                progress_callback=progress_callback,
             )
 
             with self._lock:
@@ -2255,6 +2351,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-font-size", type=parse_int_auto, default=36, help="车牌和行人框左上角标签字体大小")
     parser.add_argument("--status-font-scale", type=float, default=1.0, help="底部英文状态栏字号倍率")
     parser.add_argument("--status-font-thickness", type=parse_int_auto, default=3, help="底部英文状态栏笔画粗细")
+    parser.add_argument("--static-info-panel-height", type=parse_int_auto, default=230, help="SD 静态图片底部黑色信息栏的最小高度")
     parser.add_argument("--draw-roi", action="store_true", help="在画面上额外绘制候选区域框")
     parser.add_argument("--hide-status", action="store_true", help="隐藏底部状态栏")
     parser.add_argument("--box-display-mode", choices=("hold", "flash"), default="hold", help="车牌框显示模式：hold=持续显示最近结果，flash=仅在新结果返回时闪一下")
@@ -2399,6 +2496,8 @@ def main() -> None:
         raise ValueError("status-font-scale 必须大于 0")
     if args.status_font_thickness < 1:
         raise ValueError("status-font-thickness 必须大于等于 1")
+    if args.static_info_panel_height < 100:
+        raise ValueError("static-info-panel-height 不能小于 100")
     if args.detector_max_rois < 0:
         raise ValueError("detector-max-rois 不能小于 0")
     if not 0.0 <= args.detector_min_score <= 1.0:
@@ -2923,20 +3022,24 @@ def main() -> None:
                 metric_detector_source_name = ""
                 metric_detector_duration_ms = 0.0
 
-            tracked_detections = (
-                box_tracker.update(
-                    gray,
-                    cached_detections,
-                    detector_completed_generation,
-                    detection_gray=(
-                        None
-                        if args.disable_detection_lag_compensation
-                        else detector_source_gray
-                    ),
+            if static_image_mode:
+                # 静态图片没有帧间运动，直接显示异步线程最新的渐进结果。
+                tracked_detections = list(cached_detections)
+            else:
+                tracked_detections = (
+                    box_tracker.update(
+                        gray,
+                        cached_detections,
+                        detector_completed_generation,
+                        detection_gray=(
+                            None
+                            if args.disable_detection_lag_compensation
+                            else detector_source_gray
+                        ),
+                    )
+                    if box_tracker is not None
+                    else list(cached_detections)
                 )
-                if box_tracker is not None
-                else list(cached_detections)
-            )
 
             if args.box_display_mode == "hold":
                 hold_age = time.monotonic() - detector_latest_update_time
@@ -2966,6 +3069,7 @@ def main() -> None:
                 args.display_width,
                 args.display_height,
             )
+            window_size_resolved = False
             if (
                 not args.headless
                 and args.display_width <= 0
@@ -2974,17 +3078,34 @@ def main() -> None:
             ):
                 try:
                     _, _, window_width, window_height = cv2.getWindowImageRect(args.window_name)
-                    if window_width > 0 and window_height > 0:
+                    if window_width >= 800 and window_height >= 480:
                         target_display_width = window_width
                         target_display_height = window_height
+                        window_size_resolved = True
                 except cv2.error:
                     pass
+            if (
+                static_image_mode
+                and args.display_width <= 0
+                and args.display_height <= 0
+                and not window_size_resolved
+            ):
+                # 全屏窗口首帧可能暂时报告 640x480，先采用稳定的 720p 画布。
+                target_display_width = 1280
+                target_display_height = 720
 
+            overlay_target_height = target_display_height
+            if static_image_mode:
+                overlay_target_height = max(
+                    1,
+                    target_display_height
+                    - min(args.static_info_panel_height, target_display_height - 1),
+                )
             overlay_source_scale = calculate_overlay_source_scale(
                 source_display_width,
                 source_display_height,
                 target_display_width,
-                target_display_height,
+                overlay_target_height,
             )
             effective_text_font_size = max(
                 8,
@@ -3009,22 +3130,16 @@ def main() -> None:
             label_items = []
             image_count = int(getattr(cap, "image_count", 1))
             image_index = int(getattr(cap, "image_index", 0))
-            if static_image_mode and image_count > 1:
-                unicode_items.append(
-                    {
-                        "text": (
-                            f"图片 {image_index + 1}/{image_count}: "
-                            f"{getattr(cap, 'current_source_name', '')}  "
-                            "Enter/空格/右键: 下一张  左键/Backspace: 上一张"
-                        ),
-                        "origin": (20, 16),
-                        "color": (0, 220, 255),
-                        "outline_color": (0, 0, 0),
-                        "outline_thickness": 2,
-                    }
-                )
+            static_header_text = (
+                f"图片 {image_index + 1}/{image_count}: "
+                f"{getattr(cap, 'current_source_name', '')}  "
+                "Enter/空格/右键: 下一张  左键/Backspace: 上一张"
+                if static_image_mode
+                else ""
+            )
             if (
-                violation_monitor is not None
+                not static_image_mode
+                and violation_monitor is not None
                 and not args.hide_pedestrian_zone
                 and violation_monitor.zone_pixels
             ):
@@ -3048,20 +3163,21 @@ def main() -> None:
                     (0, 0, 255),
                     effective_box_thickness,
                 )
-                label_items.append(
-                    {
-                        "text": det.raw_label or det.label,
-                        "origin": (
-                            gx1,
-                            max(8, gy1 - effective_label_font_size - 6),
-                        ),
-                        "color": (0, 0, 255),
-                        "outline_color": (0, 0, 0),
-                        "outline_thickness": effective_outline_thickness,
-                        "font_scale": max(0.8, effective_label_font_size / 36.0),
-                        "thickness": max(2, int(round(2 * overlay_source_scale))),
-                    }
-                )
+                if not static_image_mode:
+                    label_items.append(
+                        {
+                            "text": det.raw_label or det.label,
+                            "origin": (
+                                gx1,
+                                max(8, gy1 - effective_label_font_size - 6),
+                            ),
+                            "color": (0, 0, 255),
+                            "outline_color": (0, 0, 0),
+                            "outline_thickness": effective_outline_thickness,
+                            "font_scale": max(0.8, effective_label_font_size / 36.0),
+                            "thickness": max(2, int(round(2 * overlay_source_scale))),
+                        }
+                    )
 
             for det in display_people:
                 gx1, gy1, dw, dh = det.box
@@ -3078,22 +3194,23 @@ def main() -> None:
                         int(round((3 if is_violation else 2) * overlay_source_scale)),
                     ),
                 )
-                label_items.append(
-                    {
-                        "text": det.full_text or f"行人 {det.score:.0%}",
-                        "origin": (
-                            gx1,
-                            max(8, gy1 - effective_label_font_size - 6),
-                        ),
-                        "color": person_color,
-                        "outline_color": (0, 0, 0),
-                        "outline_thickness": effective_outline_thickness,
-                        "font_scale": max(0.8, effective_label_font_size / 36.0),
-                        "thickness": max(2, int(round(2 * overlay_source_scale))),
-                    }
-                )
+                if not static_image_mode:
+                    label_items.append(
+                        {
+                            "text": det.full_text or f"行人 {det.score:.0%}",
+                            "origin": (
+                                gx1,
+                                max(8, gy1 - effective_label_font_size - 6),
+                            ),
+                            "color": person_color,
+                            "outline_color": (0, 0, 0),
+                            "outline_thickness": effective_outline_thickness,
+                            "font_scale": max(0.8, effective_label_font_size / 36.0),
+                            "thickness": max(2, int(round(2 * overlay_source_scale))),
+                        }
+                    )
 
-            if display_violations:
+            if display_violations and not static_image_mode:
                 unicode_items.append(
                     {
                         "text": f"违法告警：{len(display_violations)}名行人进入机动车道",
@@ -3189,20 +3306,23 @@ def main() -> None:
                 if violation_monitor is not None
                 else ""
             )
+            status_primary = (
+                f"FPS:{display_fps_value:.1f} "
+                f"thr={last_threshold} "
+                f"box={last_box_count} "
+                f"plate={last_plate_count} "
+                f"{person_status_text}"
+                f"{violation_status_text}"
+            )
+            status_secondary = (
+                f"mode={status_detector_mode} "
+                f"det={int(detector_busy)} "
+                f"active={status.active_pixels} "
+                f"frame={status.frame_counter}"
+            )
+            info = f"{status_primary}{status_secondary}"
             draw_unicode_texts(display, label_items, label_font)
-            if not args.hide_status:
-                info = (
-                    f"FPS:{display_fps_value:.1f} "
-                    f"thr={last_threshold} "
-                    f"box={last_box_count} "
-                    f"plate={last_plate_count} "
-                    f"{person_status_text}"
-                    f"{violation_status_text}"
-                    f"mode={status_detector_mode} "
-                    f"det={int(detector_busy)} "
-                    f"active={status.active_pixels} "
-                    f"frame={status.frame_counter}"
-                )
+            if not args.hide_status and not static_image_mode:
                 draw_text_with_outline(
                     display,
                     info,
@@ -3284,7 +3404,142 @@ def main() -> None:
                 )
 
             if not args.headless:
-                screen_frame = resize_for_display(display, args.display_width, args.display_height)
+                if static_image_mode:
+                    static_object_texts = [
+                        det.full_text or det.raw_label or det.label
+                        for det in display_detections
+                    ]
+                    static_object_texts.extend(
+                        det.full_text or det.raw_label or det.label or "行人"
+                        for det in display_people
+                    )
+                    panel_chars_per_line = max(
+                        20,
+                        int(
+                            (target_display_width - 40)
+                            / max(args.label_font_size, 1)
+                            * 1.3
+                        ),
+                    )
+                    static_result_lines = build_summary_lines(
+                        static_object_texts,
+                        panel_chars_per_line,
+                    )
+                    if not static_result_lines:
+                        static_result_lines = [
+                            (
+                                "正在检测当前图片，请稍候..."
+                                if detector_busy or detector_completed_generation == 0
+                                else "当前图片未检测到车牌或行人"
+                            )
+                        ]
+
+                    panel_line_height = args.label_font_size + 10
+                    status_area_height = 78 if not args.hide_status else 12
+                    required_panel_height = (
+                        18
+                        + args.text_font_size
+                        + 10
+                        + len(static_result_lines) * panel_line_height
+                        + status_area_height
+                    )
+                    panel_height = max(
+                        args.static_info_panel_height,
+                        required_panel_height,
+                    )
+                    panel_height = min(
+                        panel_height,
+                        max(100, target_display_height - 100),
+                    )
+                    screen_frame, _, panel_top = compose_static_image_canvas(
+                        display,
+                        target_display_width,
+                        target_display_height,
+                        panel_height,
+                    )
+                    cv2.line(
+                        screen_frame,
+                        (0, panel_top),
+                        (target_display_width - 1, panel_top),
+                        (96, 96, 96),
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+                    panel_header_font = unicode_font_for_size(args.text_font_size)
+                    panel_label_font = unicode_font_for_size(args.label_font_size)
+                    draw_unicode_texts(
+                        screen_frame,
+                        [
+                            {
+                                "text": static_header_text,
+                                "origin": (20, panel_top + 10),
+                                "color": (0, 220, 255),
+                                "outline_color": (0, 0, 0),
+                                "outline_thickness": 2,
+                            }
+                        ],
+                        panel_header_font,
+                    )
+                    result_start_y = panel_top + args.text_font_size + 24
+                    result_color = (
+                        (0, 255, 0)
+                        if static_object_texts
+                        else (0, 220, 255)
+                    )
+                    draw_unicode_texts(
+                        screen_frame,
+                        [
+                            {
+                                "text": line_text,
+                                "origin": (
+                                    20,
+                                    result_start_y + line_index * panel_line_height,
+                                ),
+                                "color": result_color,
+                                "outline_color": (0, 0, 0),
+                                "outline_thickness": 2,
+                            }
+                            for line_index, line_text in enumerate(static_result_lines)
+                        ],
+                        panel_label_font,
+                    )
+                    if not args.hide_status:
+                        status_base_y = (
+                            result_start_y
+                            + len(static_result_lines) * panel_line_height
+                            + 22
+                        )
+                        draw_text_with_outline(
+                            screen_frame,
+                            status_primary,
+                            (20, min(target_display_height - 42, status_base_y)),
+                            font_scale=args.status_font_scale,
+                            color=(255, 255, 255),
+                            thickness=args.status_font_thickness,
+                            outline_thickness=args.status_font_thickness + 2,
+                        )
+                        draw_text_with_outline(
+                            screen_frame,
+                            status_secondary,
+                            (
+                                20,
+                                min(
+                                    target_display_height - 10,
+                                    status_base_y + 34,
+                                ),
+                            ),
+                            font_scale=args.status_font_scale,
+                            color=(255, 255, 255),
+                            thickness=args.status_font_thickness,
+                            outline_thickness=args.status_font_thickness + 2,
+                        )
+                else:
+                    screen_frame = resize_for_display(
+                        display,
+                        args.display_width,
+                        args.display_height,
+                    )
                 cv2.imshow(args.window_name, screen_frame)
                 key = (
                     cv2.waitKeyEx(1)

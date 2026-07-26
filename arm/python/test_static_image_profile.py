@@ -11,8 +11,10 @@ from detector import Detection
 from pipeline import (
     AsyncFrameDetectorRunner,
     StaticImageSource,
+    build_summary_lines,
     build_static_image_tiles,
     calculate_overlay_source_scale,
+    compose_static_image_canvas,
     configured_display_size,
     configure_static_image_profile,
     deduplicate_static_plate_detections,
@@ -183,6 +185,80 @@ class StaticImageProfileTest(unittest.TestCase):
             configured_display_size(3840, 2160, 0, 720),
             (1280, 720),
         )
+
+    def test_static_canvas_reserves_black_information_panel(self):
+        image = np.full((3000, 4000, 3), 255, dtype=np.uint8)
+
+        canvas, image_rect, panel_top = compose_static_image_canvas(
+            image,
+            1280,
+            720,
+            190,
+        )
+
+        self.assertEqual(canvas.shape, (720, 1280, 3))
+        self.assertEqual(panel_top, 530)
+        self.assertEqual(image_rect[3], 530)
+        self.assertTrue(np.all(canvas[panel_top:] == 0))
+
+    def test_summary_lines_include_every_detection(self):
+        texts = ["单层车牌, 沪AF71017", "行人 92%", "新能源车牌, 苏ED51712"]
+
+        lines = build_summary_lines(texts, 22)
+
+        self.assertEqual(" | ".join(lines), " | ".join(texts))
+
+    def test_static_detector_publishes_progress_before_full_scan_finishes(self):
+        class ProgressiveDetector:
+            def __init__(self):
+                self.calls = 0
+
+            def detect(self, _frame):
+                self.calls += 1
+                if self.calls < 2:
+                    return []
+                return [
+                    Detection(
+                        label="单层车牌",
+                        score=0.80,
+                        box=(20, 20, 80, 30),
+                    )
+                ]
+
+        detector = ProgressiveDetector()
+        args = argparse.Namespace(
+            detector_source="full",
+            detector_accuracy_priority=True,
+            detector_min_score=0.05,
+            detector="rknn",
+            detector_max_rois=20,
+            hyperlpr_max_num=20,
+            detector_search_input_width=0,
+            detector_track_input_width=0,
+            detector_input_width=0,
+            detector_input_height=0,
+            input_image="/mnt/sdcard",
+            detector_merge_iou=0.55,
+            detector_roi_expand=0.25,
+            detector_box_merge_iou=0.60,
+        )
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        progress = []
+
+        detections, _ = run_detector_once(
+            detector,
+            frame,
+            [],
+            args,
+            progress_callback=lambda partial, mode: progress.append(
+                (list(partial), mode, detector.calls)
+            ),
+        )
+
+        self.assertTrue(progress)
+        self.assertLess(progress[0][2], detector.calls)
+        self.assertEqual(progress[0][0][0].label, "单层车牌")
+        self.assertTrue(detections)
 
     def test_async_frame_reset_discards_previous_image(self):
         class BlockingDetector:

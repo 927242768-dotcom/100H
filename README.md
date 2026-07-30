@@ -1,4 +1,60 @@
-# RK3568_MES2L100H 比赛工程起步版
+# RK3568 + FPGA + RKNN/NPU 智能交通感知系统
+
+## 仓库完整性
+
+本仓库按“克隆后可直接部署到已经准备好的 RK3568 板端环境”整理，包含：
+
+- ARM 端实时管线、测试和评估代码；
+- 自研 FPGA 图像预处理 RTL；
+- PDS 工程入口、约束、PCIe IP 参数配置和 BAR0 集成说明；
+- 已完成实现并上板使用的 `fpga/bitstream/pcie_dma_test.sbit`；
+- 车牌和行人 RKNN 模型；
+- HyperLPR `r2_mobile` MNN 模型；
+- RKNNLite ARM64 离线 wheel；
+- PDS、MNN、HyperLPR 与板端部署文档。
+
+受 PANGO 厂商许可限制，仓库不会重新分发带有私有源码声明的完整 PCIe IP RTL。直接运行使用仓库内 `.sbit` 即可；重新综合时需安装 PDS 2022.2-SP6.4，并通过官方 IP Compiler 或开发板资料恢复厂商 IP。详见 `docs/PDS_PROJECT.md`。
+
+## 克隆后部署
+
+```bash
+git clone https://github.com/927242768-dotcom/100H.git
+cd 100H
+python3 arm/python/install_rknnlite_from_wheel.py third_party/wheels/*.whl --clean
+```
+
+准备 HDMI 环境：
+
+```bash
+export DISPLAY=:0
+export XAUTHORITY=/home/linaro/.Xauthority
+```
+
+摄像头运行示例：
+
+```bash
+cd arm/python
+sudo -E python3 pipeline.py \
+  --resource-root /sys/bus/pci/devices/0002:21:00.0 \
+  --camera 0 \
+  --camera-width 1280 \
+  --camera-height 720 \
+  --camera-fps 30 \
+  --camera-fourcc MJPG \
+  --fpga-width 112 \
+  --fpga-height 64 \
+  --morph-cfg 0xD0 \
+  --threshold-mode percentile \
+  --threshold-percentile 78 \
+  --mask-cleanup off \
+  --detector rknn \
+  --rknn-model ../../models/plate/yolov8s.rknn \
+  --hyperlpr-model-dir ../../models/hyperlpr/r2_mobile \
+  --fullscreen
+```
+
+运行前仍需要目标板已经具备兼容的 `libhyperlpr3.so` 和 `libMNN.so`。构建步骤见 `docs/mnn_hyperlpr_integration.md`。FPGA 可直接烧录 `fpga/bitstream/pcie_dma_test.sbit`。
+
 
 这个目录是我基于你当前资料先搭好的第一版比赛工程骨架，目标是先把整条链路拆清楚并落成可继续开发的工程：
 

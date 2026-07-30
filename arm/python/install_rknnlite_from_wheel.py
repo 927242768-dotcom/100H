@@ -6,7 +6,11 @@ from pathlib import Path
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="将一个或多个 Python wheel 离线解压到工程 vendor 目录")
-    parser.add_argument("wheel", nargs="+", help="要解压的 wheel 文件路径，可一次传多个")
+    parser.add_argument(
+        "wheel",
+        nargs="*",
+        help="要解压的 wheel 文件路径；不传时自动使用仓库 third_party/wheels 目录",
+    )
     parser.add_argument(
         "--target",
         default=str(Path(__file__).resolve().parent / "vendor"),
@@ -20,7 +24,13 @@ def main() -> None:
     args = parser.parse_args()
 
     target_dir = Path(args.target).expanduser().resolve()
-    wheel_paths = [Path(item).expanduser().resolve() for item in args.wheel]
+    if args.wheel:
+        wheel_paths = [Path(item).expanduser().resolve() for item in args.wheel]
+    else:
+        bundled_dir = Path(__file__).resolve().parents[2] / "third_party" / "wheels"
+        wheel_paths = sorted(bundled_dir.glob("*.whl"))
+        if not wheel_paths:
+            raise FileNotFoundError(f"仓库中没有找到离线 wheel：{bundled_dir}")
     for wheel_path in wheel_paths:
         if not wheel_path.is_file():
             raise FileNotFoundError(f"未找到 wheel 文件：{wheel_path}")

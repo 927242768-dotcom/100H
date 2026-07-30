@@ -14,6 +14,7 @@ import numpy as np
 
 
 _RKNN_INFERENCE_LOCK = threading.Lock()
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass
@@ -84,6 +85,7 @@ class HyperLprDetector(BaseDetector):
         "/userdata/HyperLPR/HyperLPR/build/linux/install/hyperlpr3/lib/libhyperlpr3.so",
     )
     _DEFAULT_MODEL_DIRS = (
+        str(_REPO_ROOT / "models" / "hyperlpr" / "r2_mobile"),
         "/userdata/HyperLPR/HyperLPR/Prj-Linux/hyperlpr3/resource/models/r2_mobile",
         "/userdata/HyperLPR/HyperLPR/build/linux/install/hyperlpr3/resource/models/r2_mobile",
     )
@@ -438,6 +440,7 @@ class HyperLprDetector(BaseDetector):
 
 class RknnLiteDetector(BaseDetector):
     _DEFAULT_MODEL_PATHS = (
+        str(_REPO_ROOT / "models" / "plate" / "yolov8s.rknn"),
         "/userdata/yolov8-plate/yolov8s.rknn",
         "/userdata/yolov8-plate/weights/yolov8s.rknn",
         "/home/linaro/yolov8-plate/yolov8s.rknn",

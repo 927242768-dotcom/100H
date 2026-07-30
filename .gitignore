@@ -5,9 +5,8 @@ __pycache__/
 .venv/
 venv/
 
-# 板端离线依赖及第三方运行库
-vendor/
-*.whl
+# 板端解压后的本地运行依赖；离线 wheel 本身保留在 third_party/wheels
+arm/python/vendor/
 
 # C/C++、CMake 和 FPGA 构建产物
 build/
@@ -21,13 +20,11 @@ CMakeCache.txt
 *.dll
 *.exe
 *.bit
-*.sbit
 *.bin
 
-# 模型与运行时数据由部署流程单独管理
-*.rknn
+# 正式 .sbit、RKNN 与 MNN 模型是部署包的一部分，允许纳入版本库。
+# 大型训练中间模型和临时导出文件仍应按需管理。
 *.onnx
-*.mnn
 
 # 编辑器、系统及运行日志
 .vscode/

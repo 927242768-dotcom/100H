@@ -115,7 +115,7 @@
                     (_format verilog)
                     (_timespec "2026-07-22T12:02:46")
                 )
-                (_file "../../../competition_solution/fpga/src/rk3568_traffic_preprocess_fpga_v2.v"
+                (_file "../../src/rk3568_traffic_preprocess_fpga_v2.v"
                     (_format verilog)
                     (_timespec "2026-07-22T13:11:31")
                 )
